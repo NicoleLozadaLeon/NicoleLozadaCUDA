@@ -1,0 +1,22 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libopencv-dev
+      - name: Build with the reviewers' commands (no warnings allowed)
+        shell: bash
+        run: |
+          mkdir build && cd build
+          cmake .. 2>&1 | tee build.txt
+          make 2>&1 | tee -a build.txt
+          if grep -qi "warning" build.txt; then echo "Warnings found"; exit 1; fi
+      - name: Build with ThreadSanitizer
+        shell: bash
+        run: mkdir build-tsan && cd build-tsan && cmake -DENABLE_TSAN=ON .. && make
