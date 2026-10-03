@@ -27,7 +27,7 @@ target_include_directories(delivery_sim SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS} ${
 target_link_libraries(delivery_sim PRIVATE ${OpenCV_LIBS} Threads::Threads)
 if(ENABLE_TSAN)
   target_compile_options(delivery_sim PRIVATE -fsanitize=thread -g -O1 -fno-omit-frame-pointer)
-  target_link_libraries(delivery_sim PRIVATE -Fsanitize=thread)
+  target_link_libraries(delivery_sim PRIVATE -fsanitize=thread)
 endif()
 
 if(ENABLE_ASAN)
