@@ -67,12 +67,77 @@ class Net:
                 self.edges.append([old, idx, self.oneway])
                 self.actions.append("edge")
         self.selected = idx    
-    def undo(self): ...
-    def save(self, w, h): ...
-    def load(self, w, h): ...
-    def assign_restaurants(self, candidates, w, h): ...
 
-def load_candidates(): ...
+    def undo(self):
+        if not self.actions:
+            return
+        last = self.actions.pop()
+        if last == "edge":
+            self.edges.pop()
+        else:
+            self.nodes.pop()
+        self.selected = None
+
+    def save(self, w, h):
+        nodes = []
+        for i, (px, py) in enumerate(self.nodes):
+            lat, lon = px_to_latlon(px, py, w, h)
+            nodes.append({"id": f"n{i}", "lat": round(lat, 7), "lon": round(lon, 7)})
+        streets = [{"id": f"s{i}", "from": f"n{a}", "to": f"n{b}", "oneWay": bool(ow)}
+                   for i, (a, b, ow) in enumerate(self.edges)]
+        restaurants = [{"id": f"r{i}", "name": r["name"], "node": f"n{r['node']}"}
+                       for i, r in enumerate(self.restaurants)]
+        with open(OUT, "w", encoding="utf-8") as f:
+            json.dump({"nodes": nodes, "streets": streets, "restaurants": restaurants},
+                      f, indent=2, ensure_ascii=False)
+        print(f"saved {len(nodes)} nodes, {len(streets)} streets, {len(restaurants)} restaurants to {OUT}")
+
+    def load(self, w, h):
+        if not os.path.exists(OUT):
+            return
+        with open(OUT, encoding="utf-8") as f:
+            data = json.load(f)
+        index = {}
+        for i, n in enumerate(data["nodes"]):
+            self.nodes.append(list(latlon_to_px(n["lat"], n["lon"], w, h)))
+            index[n["id"]] = i
+        for s in data["streets"]:
+            self.edges.append([index[s["from"]], index[s["to"]], s["oneWay"]])
+        for r in data.get("restaurants", []):
+            self.restaurants.append({"name": r["name"], "node": index[r["node"]], "meters": 0.0})
+        print(f"loaded {len(self.nodes)} nodes, {len(self.edges)} streets from {OUT}")
+
+    def assign_restaurants(self, candidates, w, h):
+        self.restaurants = []
+        if not self.nodes:
+            print("trace some nodes first")
+            return
+        for chosen in CHOSEN:
+            found = [c for c in candidates if ascii_lower(c[2]) == chosen]
+            if not found:
+                print(f"{chosen}: not found in the CSV")
+                continue
+            lat, lon, name = found[0]
+            best, best_m = None, float("inf")
+            for i, (px, py) in enumerate(self.nodes):
+                nlat, nlon = px_to_latlon(px, py, w, h)
+                m = haversine_m(lat, lon, nlat, nlon)
+                if m < best_m:
+                    best, best_m = i, m
+            warn = "   <-- WARNING: farther than 100 m" if best_m > 100 else ""
+            print(f"{name} -> n{best}, {best_m:.0f} m{warn}")
+            clean = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+            self.restaurants.append({"name": clean, "node": best, "meters": best_m})
+
+def load_candidates():
+    out = []
+    with open(CSV_FILE, encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader)                       # skip the header line
+        for row in reader:
+            if len(row) >= 3:
+                out.append((float(row[0]), float(row[1]), row[2]))
+    return out
 
 def draw(view, net, scale, candidates, show_candidates):
     img = view.copy()
@@ -92,6 +157,16 @@ def draw(view, net, scale, candidates, show_candidates):
     mode = "ONEWAY" if net.oneway else "two-way"
     text = f"nodes {len(net.nodes)}  edges {len(net.edges)}  oneway {n_oneway}  mode {mode}"
     cv2.putText(img, text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    if show_candidates:
+        h_img, w_img = view.shape[:2]
+        for lat, lon, name in candidates:
+            px, py = latlon_to_px(lat, lon, w_img / scale, h_img / scale)
+            x, y = int(px * scale), int(py * scale)
+            chosen = ascii_lower(name) in CHOSEN
+            color = (0, 140, 255) if chosen else (255, 0, 255)
+            size = 6 if chosen else 4
+            cv2.rectangle(img, (x - size, y - size), (x + size, y + size), color, -1)
+            cv2.putText(img, ascii_lower(name)[:18], (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
     return img
 
 def main():
@@ -106,7 +181,8 @@ def main():
     max_oy = view.shape[0] - view_h
     oy = 0
     net = Net()
-
+    net.load(w, h)
+   
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             net.click(x / scale, (y + oy) / scale, PICK_RADIUS / scale)
@@ -116,16 +192,23 @@ def main():
     cv2.namedWindow("network")
     cv2.setMouseCallback("network", on_mouse)
     show_candidates = False
+    candidates = load_candidates()
     while True:
-        full = draw(view, net, scale, [], show_candidates)
+        full = draw(view, net, scale, candidates, show_candidates)
         frame = full[oy:oy + view_h].copy()
         n_oneway = sum(1 for e in net.edges if e[2])
         status = f"nodes {len(net.nodes)}  edges {len(net.edges)}  oneway {n_oneway}  mode {'ONEWAY' if net.oneway else 'two-way'}  y {oy}/{max_oy}"
         cv2.putText(frame, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         cv2.imshow("network", frame)
         key = cv2.waitKey(30) & 0xFF
+       
         if key == ord("q"):
+            net.save(w, h)
             break
+        elif key == ord("u"):
+            net.undo()
+        elif key == ord("s"):
+            net.save(w, h)
         elif key == ord("o"):
             net.oneway = not net.oneway
         elif key == ord("n"):
@@ -134,6 +217,11 @@ def main():
             oy = min(max_oy, oy + SCROLL_STEP)
         elif key == ord("i"):
             oy = max(0, oy - SCROLL_STEP)
+        elif key == ord("d"):
+            show_candidates = not show_candidates
+        elif key == ord("r"):
+            net.assign_restaurants(candidates, w, h)
+
     cv2.destroyAllWindows()
 if __name__ == "__main__":
     main()
