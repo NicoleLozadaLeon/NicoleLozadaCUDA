@@ -11,8 +11,7 @@ ZOOM = 0.7
 VIEW_H = 900        
 SCROLL_STEP = 120   
 PICK_RADIUS = 12
-CHOSEN = ["tgi fridays", "pizza hut", "pollo campeon", "sushi bar by slatkis", "tarbush", "la gaditana"]
-
+CHOSEN = ["tradiciones", "trivento", "menta", "ambika", "mucho", "tinto"]
 def ascii_lower(s):
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
 
@@ -163,6 +162,8 @@ def draw(view, net, scale, candidates, show_candidates):
             px, py = latlon_to_px(lat, lon, w_img / scale, h_img / scale)
             x, y = int(px * scale), int(py * scale)
             chosen = ascii_lower(name) in CHOSEN
+            if show_candidates == 1 and not chosen:
+                continue
             color = (0, 140, 255) if chosen else (255, 0, 255)
             size = 6 if chosen else 4
             cv2.rectangle(img, (x - size, y - size), (x + size, y + size), color, -1)
@@ -177,6 +178,8 @@ def main():
     h, w = img.shape[:2]
     scale = ZOOM
     view = cv2.resize(img, None, fx=scale, fy=scale)
+    faded = cv2.convertScaleAbs(view, alpha=0.6, beta=80)
+    use_faded = True
     view_h = min(VIEW_H, view.shape[0])
     max_oy = view.shape[0] - view_h
     oy = 0
@@ -194,7 +197,8 @@ def main():
     show_candidates = False
     candidates = load_candidates()
     while True:
-        full = draw(view, net, scale, candidates, show_candidates)
+        full = draw(faded if use_faded else view, net, scale, candidates, show_candidates)
+
         frame = full[oy:oy + view_h].copy()
         n_oneway = sum(1 for e in net.edges if e[2])
         status = f"nodes {len(net.nodes)}  edges {len(net.edges)}  oneway {n_oneway}  mode {'ONEWAY' if net.oneway else 'two-way'}  y {oy}/{max_oy}"
@@ -205,6 +209,8 @@ def main():
         if key == ord("q"):
             net.save(w, h)
             break
+        elif key == ord("f"):
+            use_faded = not use_faded
         elif key == ord("u"):
             net.undo()
         elif key == ord("s"):
@@ -218,7 +224,7 @@ def main():
         elif key == ord("i"):
             oy = max(0, oy - SCROLL_STEP)
         elif key == ord("d"):
-            show_candidates = not show_candidates
+            show_candidates = (show_candidates + 1) % 3
         elif key == ord("r"):
             net.assign_restaurants(candidates, w, h)
 
