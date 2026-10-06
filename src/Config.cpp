@@ -62,7 +62,19 @@ Config load_config(const std::string& path) {
                       require<double>(b, "west", "map.bounds"), require<double>(b, "east", "map.bounds")};
     if (cfg.map.bounds.north <= cfg.map.bounds.south || cfg.map.bounds.east <= cfg.map.bounds.west)
         throw ConfigError("map.bounds: north must be greater than south and east greater than west");
-    // TODO 2: nodes. Not empty. Unique ids. Collect the ids in a std::set<std::string>.
+    std::set<std::string> node_ids;
+    for (const json& n : require_array(root, "nodes", "config")) {
+        NodeDef nd;
+        nd.id = require<std::string>(n, "id", "node");
+        nd.lat = require<double>(n, "lat", "node " + nd.id);
+        nd.lon = require<double>(n, "lon", "node " + nd.id);
+        if (!node_ids.insert(nd.id).second)
+            throw ConfigError("duplicate node id '" + nd.id + "'");
+        cfg.nodes.push_back(nd);
+    }
+    if (cfg.nodes.empty())
+        throw ConfigError("config: 'nodes' must contain at least one node");
+
     // TODO 3: streets. from/to must be in the set.
     // TODO 4: restaurants. node in the set, pickupSlots >= 1, prepTimeMs has 2 values, min <= max.
     // TODO 5: fleet (+ startNode in the set), orders, dispatch, incidents, simulation, with range checks.
