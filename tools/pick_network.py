@@ -11,7 +11,7 @@ ZOOM = 0.7
 VIEW_H = 900        
 SCROLL_STEP = 120   
 PICK_RADIUS = 12
-CHOSEN = ["tradiciones", "trivento", "menta", "ambika", "mucho", "tinto"]
+CHOSEN = ["tradiciones", "maminco", "menta", "ambika", "pizza hut", "tinto"]
 def ascii_lower(s):
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
 
@@ -53,6 +53,17 @@ class Net:
                 best, best_d = i, d
         return best
 
+    def delete_selected(self):
+        i = self.selected
+        if i is None:
+            return
+        self.nodes.pop(i)
+        self.edges = [[a - (a > i), b - (b > i), ow]
+                      for a, b, ow in self.edges if a != i and b != i]
+        self.restaurants = [dict(r, node=r["node"] - (r["node"] > i))
+                            for r in self.restaurants if r["node"] != i]
+        self.actions = []
+        self.selected = None
     def click(self, px, py, radius):
         old = self.selected
         idx = self.nearest(px, py, radius)
@@ -223,6 +234,8 @@ def main():
             oy = min(max_oy, oy + SCROLL_STEP)
         elif key == ord("i"):
             oy = max(0, oy - SCROLL_STEP)
+        elif key == ord("x"):
+            net.delete_selected()
         elif key == ord("d"):
             show_candidates = (show_candidates + 1) % 3
         elif key == ord("r"):
