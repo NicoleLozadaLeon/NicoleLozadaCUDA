@@ -87,7 +87,24 @@ Config load_config(const std::string& path) {
             throw ConfigError("street '" + sd.id + "' refers to unknown node '" + sd.to + "'");
         cfg.streets.push_back(sd);
     }
-    // TODO 4: restaurants. node in the set, pickupSlots >= 1, prepTimeMs has 2 values, min <= max.
+
+    for (const json& r : require_array(root, "restaurants", "config")) {
+        RestaurantDef rd;
+        rd.id = require<std::string>(r, "id", "restaurant");
+        rd.name = require<std::string>(r, "name", "restaurant " + rd.id);
+        rd.node = require<std::string>(r, "node", "restaurant " + rd.id);
+        rd.pickupSlots = require<int>(r, "pickupSlots", "restaurant " + rd.id);
+        rd.prepTimeMs = require<std::array<int, 2>>(r, "prepTimeMs", "restaurant " + rd.id);
+        if (node_ids.count(rd.node) == 0)
+            throw ConfigError("restaurant '" + rd.id + "' refers to unknown node '" + rd.node + "'");
+        if (rd.pickupSlots < 1)
+            throw ConfigError("restaurant '" + rd.id + "': pickupSlots must be at least 1");
+        if (rd.prepTimeMs[0] < 0 || rd.prepTimeMs[0] > rd.prepTimeMs[1])
+            throw ConfigError("restaurant '" + rd.id + "': prepTimeMs must be [min, max] with 0 <= min <= max");
+        cfg.restaurants.push_back(rd);
+    }
+    if (cfg.restaurants.empty())
+        throw ConfigError("config: 'restaurants' must contain at least one restaurant");
     // TODO 5: fleet (+ startNode in the set), orders, dispatch, incidents, simulation, with range checks.
     return cfg;
 }
