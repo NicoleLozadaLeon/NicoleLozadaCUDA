@@ -75,7 +75,18 @@ Config load_config(const std::string& path) {
     if (cfg.nodes.empty())
         throw ConfigError("config: 'nodes' must contain at least one node");
 
-    // TODO 3: streets. from/to must be in the set.
+    for (const json& s : require_array(root, "streets", "config")) {
+        StreetDef sd;
+        sd.id = require<std::string>(s, "id", "street");
+        sd.from = require<std::string>(s, "from", "street " + sd.id);
+        sd.to = require<std::string>(s, "to", "street " + sd.id);
+        sd.oneWay = require<bool>(s, "oneWay", "street " + sd.id);
+        if (node_ids.count(sd.from) == 0)
+            throw ConfigError("street '" + sd.id + "' refers to unknown node '" + sd.from + "'");
+        if (node_ids.count(sd.to) == 0)
+            throw ConfigError("street '" + sd.id + "' refers to unknown node '" + sd.to + "'");
+        cfg.streets.push_back(sd);
+    }
     // TODO 4: restaurants. node in the set, pickupSlots >= 1, prepTimeMs has 2 values, min <= max.
     // TODO 5: fleet (+ startNode in the set), orders, dispatch, incidents, simulation, with range checks.
     return cfg;
