@@ -105,6 +105,50 @@ Config load_config(const std::string& path) {
     }
     if (cfg.restaurants.empty())
         throw ConfigError("config: 'restaurants' must contain at least one restaurant");
-    // TODO 5: fleet (+ startNode in the set), orders, dispatch, incidents, simulation, with range checks.
+    const json& f = require_object(root, "fleet", "config");
+    cfg.fleet.couriers = require<int>(f, "couriers", "fleet");
+    cfg.fleet.bagCapacity = require<int>(f, "bagCapacity", "fleet");
+    cfg.fleet.speedKmh = require<double>(f, "speedKmh", "fleet");
+    cfg.fleet.startNode = require<std::string>(f, "startNode", "fleet");
+    if (cfg.fleet.couriers < 1)
+        throw ConfigError("fleet.couriers must be at least 1");
+    if (cfg.fleet.bagCapacity < 1)
+        throw ConfigError("fleet.bagCapacity must be at least 1");
+    if (cfg.fleet.speedKmh <= 0)
+        throw ConfigError("fleet.speedKmh must be greater than 0");
+    if (node_ids.count(cfg.fleet.startNode) == 0)
+        throw ConfigError("fleet.startNode refers to unknown node '" + cfg.fleet.startNode + "'");
+
+    const json& o = require_object(root, "orders", "config");
+    cfg.orders.meanIntervalMs = require<int>(o, "meanIntervalMs", "orders");
+    cfg.orders.burstMax = require<int>(o, "burstMax", "orders");
+    cfg.orders.maxPending = require<int>(o, "maxPending", "orders");
+    cfg.orders.seed = require<long long>(o, "seed", "orders");
+    if (cfg.orders.meanIntervalMs < 1)
+        throw ConfigError("orders.meanIntervalMs must be at least 1");
+    if (cfg.orders.burstMax < 1)
+        throw ConfigError("orders.burstMax must be at least 1");
+    if (cfg.orders.maxPending < 0)
+        throw ConfigError("orders.maxPending must not be negative");
+
+    const json& d = require_object(root, "dispatch", "config");
+    cfg.dispatch.quoteTimeoutMs = require<int>(d, "quoteTimeoutMs", "dispatch");
+    cfg.dispatch.acceptTimeoutMs = require<int>(d, "acceptTimeoutMs", "dispatch");
+    if (cfg.dispatch.quoteTimeoutMs < 0 || cfg.dispatch.acceptTimeoutMs < 0)
+        throw ConfigError("dispatch timeouts must not be negative");
+
+    const json& inc = require_object(root, "incidents", "config");
+    cfg.incidents.breakdownProbability = require<double>(inc, "breakdownProbability", "incidents");
+    if (cfg.incidents.breakdownProbability < 0 || cfg.incidents.breakdownProbability > 1)
+        throw ConfigError("incidents.breakdownProbability must be between 0 and 1");
+
+    const json& sim = require_object(root, "simulation", "config");
+    cfg.simulation.durationS = require<int>(sim, "durationS", "simulation");
+    cfg.simulation.timeScale = require<double>(sim, "timeScale", "simulation");
+    if (cfg.simulation.durationS < 0)
+        throw ConfigError("simulation.durationS must not be negative");
+    if (cfg.simulation.timeScale <= 0)
+        throw ConfigError("simulation.timeScale must be greater than 0");
+
     return cfg;
 }
