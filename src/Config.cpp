@@ -1,0 +1,70 @@
+#include "Config.h"
+
+#include <fstream>
+#include <set>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+using json = nlohmann::json;
+
+// Reads j.at(key) as T. A missing key or a wrong type becomes a ConfigError naming the key.
+template <typename T>
+T require(const json& j, const char* key, const std::string& where) {
+    try {
+        return j.at(key).get<T>();
+    } catch (const json::exception&) {
+        throw ConfigError(where + ": missing or invalid property '" + key + "'");
+    }
+}
+
+// Returns j.at(key) after checking it is an object (or an array).
+const json& require_object(const json& j, const char* key, const char* where) {
+    if (!j.is_object() || !j.contains(key) || !j.at(key).is_object())
+        throw ConfigError(std::string(where) + ": missing or invalid object '" + key + "'");
+    return j.at(key);
+}
+
+const json& require_array(const json& j, const char* key, const char* where) {
+    if (!j.is_object() || !j.contains(key) || !j.at(key).is_array())
+        throw ConfigError(std::string(where) + ": missing or invalid array '" + key + "'");
+    return j.at(key);
+}
+
+// Folder of the config file, with a trailing slash ("" if the path has no folder).
+std::string folder_of(const std::string& path) {
+    const auto pos = path.find_last_of("/\\");
+    return pos == std::string::npos ? std::string() : path.substr(0, pos + 1);
+}
+
+}  // namespace
+
+Config load_config(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw ConfigError("cannot read configuration file: " + path);
+
+    json root;
+    try {
+        in >> root;
+    } catch (const json::exception& e) {
+        throw ConfigError(std::string("malformed JSON in ") + path + ": " + e.what());
+    }
+    if (!root.is_object()) throw ConfigError("the configuration must be a JSON object");
+
+    Config cfg;
+    const json& m = require_object(root, "map", "config");
+    const std::string image = require<std::string>(m, "image", "map");
+    cfg.map.image = (!image.empty() && image[0] == '/') ? image : folder_of(path) + image;
+    cfg.map.attribution = require<std::string>(m, "attribution", "map");
+    const json& b = require_object(m, "bounds", "map");
+    cfg.map.bounds = {require<double>(b, "north", "map.bounds"), require<double>(b, "south", "map.bounds"),
+                      require<double>(b, "west", "map.bounds"), require<double>(b, "east", "map.bounds")};
+    if (cfg.map.bounds.north <= cfg.map.bounds.south || cfg.map.bounds.east <= cfg.map.bounds.west)
+        throw ConfigError("map.bounds: north must be greater than south and east greater than west");
+    // TODO 2: nodes. Not empty. Unique ids. Collect the ids in a std::set<std::string>.
+    // TODO 3: streets. from/to must be in the set.
+    // TODO 4: restaurants. node in the set, pickupSlots >= 1, prepTimeMs has 2 values, min <= max.
+    // TODO 5: fleet (+ startNode in the set), orders, dispatch, incidents, simulation, with range checks.
+    return cfg;
+}
