@@ -46,7 +46,7 @@ Config load_config(const std::string& path) {
 
     json root;
     try {
-        in >> root;
+        root = json::parse(in);
     } catch (const json::exception& e) {
         throw ConfigError(std::string("malformed JSON in ") + path + ": " + e.what());
     }
@@ -124,8 +124,8 @@ Config load_config(const std::string& path) {
     cfg.orders.burstMax = require<int>(o, "burstMax", "orders");
     cfg.orders.maxPending = require<int>(o, "maxPending", "orders");
     cfg.orders.seed = require<long long>(o, "seed", "orders");
-    if (cfg.orders.meanIntervalMs < 1)
-        throw ConfigError("orders.meanIntervalMs must be at least 1");
+    if (cfg.orders.meanIntervalMs < 0)
+        throw ConfigError("orders.meanIntervalMs must not be negative");
     if (cfg.orders.burstMax < 1)
         throw ConfigError("orders.burstMax must be at least 1");
     if (cfg.orders.maxPending < 0)
