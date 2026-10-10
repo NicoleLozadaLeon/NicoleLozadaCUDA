@@ -1,10 +1,36 @@
 #include <iostream>
+#include <thread>
+#include <vector>
 #include <string>
 
 #include "Config.h"
+#include "EventLog.h"
 #include "Graph.h"
+#include "SimClock.h"
+
+// TEMPORARY: stress test of the EventLog from many threads (removed later).
+static void stress_log(const std::string& path) {
+    SimClock clock(60.0);
+    EventLog log(path, clock);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&log, t] {
+            for (int i = 0; i < 500; ++i) {
+                const std::string order = "o" + std::to_string(t * 1000 + i);
+                log.orderCreated(order, "r0");
+                log.orderDelivered(order, "c" + std::to_string(t));
+            }
+        });
+    }
+    for (std::thread& th : threads) th.join();
+    std::cout << log.summaryJson() << "\n";
+}
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--stress-log") {
+        stress_log(argv[2]);
+        return 0;
+    }
     if (argc < 2) {
         std::cerr << "usage: delivery_sim <config.json> [--log <path>]\n";
         return 1;
