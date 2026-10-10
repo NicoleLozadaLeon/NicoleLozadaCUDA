@@ -25,7 +25,15 @@ double haversine_m(double lat1, double lon1, double lat2, double lon2) {
 
 Graph::Graph(const Config& cfg) {
     const int n = static_cast<int>(cfg.nodes.size());
-    // TODO 1: nodes
+    ids_.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const NodeDef& nd = cfg.nodes[static_cast<std::size_t>(i)];
+        ids_.push_back(nd.id);
+        index_[nd.id] = i;
+        lat_.push_back(nd.lat);
+        lon_.push_back(nd.lon);
+    }
+
     // TODO 2: edges (one-way respected)
     // TODO 3: all-pairs Dijkstra
     (void)n;
