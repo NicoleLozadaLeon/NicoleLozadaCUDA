@@ -3,15 +3,16 @@
 import csv, json, math, os, unicodedata
 import cv2
 
-W, S, E, N = -63.20374411309951, -17.779011638450203, -63.18915387798629, -17.752162388363526
-IMAGE = "data/equipetrol.jpg"
+W, S, E, N = -63.205248240852164, -17.77504707884483, -63.187351138452286, -17.750567044823004
+IMAGE = "data/equipetrol.png"
 CSV_FILE = "data/restaurants_osm.csv"
 OUT = "tools/network_draft.json"
-ZOOM = 0.7          
-VIEW_H = 900        
+ZOOM = 1.0          
+VIEW_H = 950        
+VIEW_W = 1250         # width of the visible window
 SCROLL_STEP = 120   
 PICK_RADIUS = 12
-CHOSEN = ["tradiciones", "maminco", "menta", "ambika", "pizza hut", "tinto"]
+CHOSEN = ["tradiciones", "pizza hut", "ambika", "menta", "yogen fruz", "sushi bar by slatkis"]
 def ascii_lower(s):
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
 
@@ -192,6 +193,9 @@ def main():
     faded = cv2.convertScaleAbs(view, alpha=0.6, beta=80)
     use_faded = True
     view_h = min(VIEW_H, view.shape[0])
+    view_w = min(VIEW_W, view.shape[1])
+    max_ox = view.shape[1] - view_w
+    ox = 0
     max_oy = view.shape[0] - view_h
     oy = 0
     net = Net()
@@ -199,7 +203,7 @@ def main():
    
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            net.click(x / scale, (y + oy) / scale, PICK_RADIUS / scale)
+            net.click((x + ox) / scale, (y + oy) / scale, PICK_RADIUS / scale)
         elif event == cv2.EVENT_RBUTTONDOWN:
             net.selected = None
 
@@ -210,9 +214,9 @@ def main():
     while True:
         full = draw(faded if use_faded else view, net, scale, candidates, show_candidates)
 
-        frame = full[oy:oy + view_h].copy()
+        frame = full[oy:oy + view_h, ox:ox + view_w].copy()
         n_oneway = sum(1 for e in net.edges if e[2])
-        status = f"nodes {len(net.nodes)}  edges {len(net.edges)}  oneway {n_oneway}  mode {'ONEWAY' if net.oneway else 'two-way'}  y {oy}/{max_oy}"
+        status = f"nodes {len(net.nodes)}  edges {len(net.edges)}  oneway {n_oneway}  mode {'ONEWAY' if net.oneway else 'two-way'}  x {ox}/{max_ox}  y {oy}/{max_oy}"
         cv2.putText(frame, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         cv2.imshow("network", frame)
         key = cv2.waitKey(30) & 0xFF
@@ -234,6 +238,10 @@ def main():
             oy = min(max_oy, oy + SCROLL_STEP)
         elif key == ord("i"):
             oy = max(0, oy - SCROLL_STEP)
+        elif key == ord("j"):
+            ox = max(0, ox - SCROLL_STEP)
+        elif key == ord("l"):
+            ox = min(max_ox, ox + SCROLL_STEP)
         elif key == ord("x"):
             net.delete_selected()
         elif key == ord("d"):
