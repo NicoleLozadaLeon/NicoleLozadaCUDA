@@ -1,0 +1,59 @@
+#include "Graph.h"
+
+#include <cmath>
+#include <cstddef>
+#include <functional>
+#include <queue>
+#include <utility>
+
+namespace {
+
+// Great-circle distance in meters between two lat/lon points.
+double haversine_m(double lat1, double lon1, double lat2, double lon2) {
+    const double kEarthRadius = 6371000.0;
+    const double kDegToRad = 3.14159265358979323846 / 180.0;
+    const double p1 = lat1 * kDegToRad;
+    const double p2 = lat2 * kDegToRad;
+    const double dp = p2 - p1;
+    const double dl = (lon2 - lon1) * kDegToRad;
+    const double a = std::sin(dp / 2) * std::sin(dp / 2) +
+                     std::cos(p1) * std::cos(p2) * std::sin(dl / 2) * std::sin(dl / 2);
+    return 2 * kEarthRadius * std::asin(std::sqrt(a));
+}
+
+}  // namespace
+
+Graph::Graph(const Config& cfg) {
+    const int n = static_cast<int>(cfg.nodes.size());
+    // TODO 1: nodes
+    // TODO 2: edges (one-way respected)
+    // TODO 3: all-pairs Dijkstra
+    (void)n;
+}
+
+int Graph::nodeCount() const { return static_cast<int>(ids_.size()); }
+int Graph::indexOf(const std::string& id) const { return index_.at(id); }
+const std::string& Graph::idOf(int node) const { return ids_[static_cast<std::size_t>(node)]; }
+double Graph::lat(int node) const { return lat_[static_cast<std::size_t>(node)]; }
+double Graph::lon(int node) const { return lon_[static_cast<std::size_t>(node)]; }
+const std::vector<Graph::Edge>& Graph::edgesFrom(int node) const {
+    return adj_[static_cast<std::size_t>(node)];
+}
+
+double Graph::distance(int from, int to) const {
+    return dist_[static_cast<std::size_t>(from) * ids_.size() + static_cast<std::size_t>(to)];
+}
+
+bool Graph::reachable(int from, int to) const { return distance(from, to) < kUnreachable; }
+
+std::vector<int> Graph::route(int from, int to) const {
+    std::vector<int> path;
+    if (!reachable(from, to)) return path;
+    int cur = from;
+    path.push_back(cur);
+    while (cur != to) {
+        cur = next_[static_cast<std::size_t>(cur) * ids_.size() + static_cast<std::size_t>(to)];
+        path.push_back(cur);
+    }
+    return path;
+}
