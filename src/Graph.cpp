@@ -45,8 +45,33 @@ Graph::Graph(const Config& cfg) {
         if (!st.oneWay)
             adj_[static_cast<std::size_t>(b)].push_back({a, meters, static_cast<int>(s)});
     }
-    // TODO 3: all-pairs Dijkstra
-    (void)n;
+    const std::size_t N = static_cast<std::size_t>(n);
+    dist_.assign(N * N, kUnreachable);
+    next_.assign(N * N, -1);
+    using Item = std::pair<double, int>;
+    for (int s = 0; s < n; ++s) {
+        const std::size_t row = static_cast<std::size_t>(s) * N;
+        std::vector<int> first(N, -1);
+        std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;
+        dist_[row + static_cast<std::size_t>(s)] = 0.0;
+        pq.push({0.0, s});
+        while (!pq.empty()) {
+            const Item top = pq.top();
+            pq.pop();
+            const double d = top.first;
+            const int u = top.second;
+            if (d > dist_[row + static_cast<std::size_t>(u)]) continue;   // stale entry
+            for (const Edge& e : adj_[static_cast<std::size_t>(u)]) {
+                const double candidate = d + e.meters;
+                if (candidate < dist_[row + static_cast<std::size_t>(e.to)]) {
+                    dist_[row + static_cast<std::size_t>(e.to)] = candidate;
+                    first[static_cast<std::size_t>(e.to)] = (u == s) ? e.to : first[static_cast<std::size_t>(u)];
+                    next_[row + static_cast<std::size_t>(e.to)] = first[static_cast<std::size_t>(e.to)];
+                    pq.push({candidate, e.to});
+                }
+            }
+        }
+    }
 }
 
 int Graph::nodeCount() const { return static_cast<int>(ids_.size()); }
