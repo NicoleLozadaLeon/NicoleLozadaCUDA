@@ -40,13 +40,45 @@ void EventLog::orderDelivered(const std::string& order, const std::string& couri
     }
 }
 
-// TODO A: orderAssigned(order, courier)                      fields: order, courier
-// TODO B: pickupStarted(order, courier, restaurant)          fields: order, courier, restaurant
-// TODO C: orderPickedUp(order, courier, restaurant)          fields: order, courier, restaurant
-// TODO D: orderRejected(order, reason)                       fields: order, reason; ++rejected
-// TODO E: courierBreakdown(courier)                          fields: courier; ++breakdowns
-// TODO F: orderReassigned(order, from, to)                   fields: order, from, to; ++reassigned
-// TODO G: simulationStopping()                               no fields
+void EventLog::orderAssigned(const std::string& order, const std::string& courier) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emit_("orderAssigned", {{"order", order}, {"courier", courier}});
+}
+
+void EventLog::pickupStarted(const std::string& order, const std::string& courier,
+                             const std::string& restaurant) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emit_("pickupStarted", {{"order", order}, {"courier", courier}, {"restaurant", restaurant}});
+}
+
+void EventLog::orderPickedUp(const std::string& order, const std::string& courier,
+                             const std::string& restaurant) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emit_("orderPickedUp", {{"order", order}, {"courier", courier}, {"restaurant", restaurant}});
+}
+
+void EventLog::orderRejected(const std::string& order, const std::string& reason) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emit_("orderRejected", {{"order", order}, {"reason", reason}});
+    ++counters_.rejected;
+}
+
+void EventLog::courierBreakdown(const std::string& courier) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emit_("courierBreakdown", {{"courier", courier}});
+    ++counters_.breakdowns;
+}
+
+void EventLog::orderReassigned(const std::string& order, const std::string& from, const std::string& to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emit_("orderReassigned", {{"order", order}, {"from", from}, {"to", to}});
+    ++counters_.reassigned;
+}
+
+void EventLog::simulationStopping() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emit_("simulationStopping", {});
+}
 
 EventLog::Summary EventLog::summary() const {
     std::lock_guard<std::mutex> lock(mutex_);
