@@ -4,8 +4,8 @@ import json, math
 
 DRAFT = "tools/network_draft.json"
 OUT = "config/equipetrol.json"
-BOUNDS = {"north": -17.752162388363526, "south": -17.779011638450203,
-          "west": -63.20374411309951, "east": -63.18915387798629}
+BOUNDS = {"north": -17.750567044823004, "south": -17.77504707884483,
+          "west": -63.205248240852164, "east": -63.187351138452286}
 SLOTS = [1, 2, 1, 2, 1, 2, 1, 2]          # pickupSlots per restaurant, in order
 PREP_MS = [60000, 240000]                 # [min, max] preparation time
 
@@ -34,7 +34,7 @@ def main():
         restaurants.append({"id": f"r{i}", "name": r["name"], "node": r["node"],
                             "pickupSlots": SLOTS[i % len(SLOTS)], "prepTimeMs": PREP_MS})
     cfg = {
-        "map": {"image": "../data/equipetrol.jpg",
+        "map": {"image": "../data/equipetrol.png",
                 "attribution": "© OpenStreetMap contributors", "bounds": BOUNDS},
         "nodes": nodes, "streets": streets, "restaurants": restaurants,
         "fleet": {"couriers": 8, "bagCapacity": 3, "speedKmh": 30, "startNode": start},
