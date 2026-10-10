@@ -2,6 +2,7 @@
 """Checks a traced network: counts, endpoints, edge lengths, connectivity with one-way rules, spread."""
 import json, math, sys
 
+W, S, E, N = -63.205248240852164, -17.77504707884483, -63.187351138452286, -17.750567044823004
 PATH = sys.argv[1] if len(sys.argv) > 1 else "tools/network_draft.json"
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -67,15 +68,17 @@ def main():
     if len(back) != len(nodes):
         problems.append(f"cannot reach {start}: {sorted(set(nodes) - back)}")
 
-    lats = sorted(n["lat"] for n in nodes.values())
-    lo, hi = lats[0], lats[-1]
-    third = (hi - lo) / 3
-    bands = [0, 0, 0]
-    for v in lats:
-        bands[min(2, int((v - lo) / third))] += 1
-    print(f"nodes per third of the band (south, middle, north): {bands}")
-    if min(bands) < 5:
-        problems.append("nodes are not spread: one third has fewer than 5")
+    grid = [[0] * 3 for _ in range(6)]
+    for n in nodes.values():
+        c = min(2, max(0, int((n["lon"] - W) / (E - W) * 3)))
+        r = min(5, max(0, int((N - n["lat"]) / (N - S) * 6)))
+        grid[r][c] += 1
+    print("nodes per cell (6 rows, top to bottom, x 3 columns):")
+    for row in grid:
+        print("  ", row)
+    empty_rows = [i + 1 for i, row in enumerate(grid) if sum(row) == 0]
+    if empty_rows:
+        problems.append(f"no nodes in rows {empty_rows}: the network does not run along the whole length of the chosen side")
 
     used = [r["node"] for r in restaurants]
     for r in restaurants:
