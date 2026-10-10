@@ -34,7 +34,17 @@ Graph::Graph(const Config& cfg) {
         lon_.push_back(nd.lon);
     }
 
-    // TODO 2: edges (one-way respected)
+    adj_.assign(static_cast<std::size_t>(n), std::vector<Edge>());
+    for (std::size_t s = 0; s < cfg.streets.size(); ++s) {
+        const StreetDef& st = cfg.streets[s];
+        const int a = index_.at(st.from);
+        const int b = index_.at(st.to);
+        const double meters = haversine_m(lat_[static_cast<std::size_t>(a)], lon_[static_cast<std::size_t>(a)],
+                                          lat_[static_cast<std::size_t>(b)], lon_[static_cast<std::size_t>(b)]);
+        adj_[static_cast<std::size_t>(a)].push_back({b, meters, static_cast<int>(s)});
+        if (!st.oneWay)
+            adj_[static_cast<std::size_t>(b)].push_back({a, meters, static_cast<int>(s)});
+    }
     // TODO 3: all-pairs Dijkstra
     (void)n;
 }
