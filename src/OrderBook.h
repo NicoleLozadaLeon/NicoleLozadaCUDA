@@ -30,3 +30,4 @@ private:
     const std::size_t maxPending_;
     bool closed_ = false;
 };
+
