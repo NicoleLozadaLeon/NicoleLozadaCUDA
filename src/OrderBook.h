@@ -4,7 +4,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
-
+#include <vector>
 #include "Order.h"
 
 // Monitor: the orders waiting for a courier, in arrival order (FIFO), with a size limit.
@@ -15,14 +15,15 @@ public:
     // Adds an order at the back. Returns false if the book is full; then the order is NOT
     // taken and the caller still owns it (it rejects it with queueFull).
     bool submit(Order&& order);
-    // Puts at the FRONT an order the dispatcher could not place yet. Never refused.
-    void putBack(Order&& order);
-    // Blocks until an order is available, or returns std::nullopt once the book is closed and empty.
+
+    //Blocks until an order is available. Returns std::nullopt once the book is closed:
+    // orders still inside stay there and end as pending (the stop must take < 5 s)
     std::optional<Order> take();
     // No more orders will arrive: wakes every thread blocked in take().
     void close();
     std::size_t size() const;
-
+    //Snapshot for the window: delivery node of every waiting order
+    std::vector<int> deliveryNodes() const;
 private:
     mutable std::mutex mutex_;
     std::condition_variable ready_;
