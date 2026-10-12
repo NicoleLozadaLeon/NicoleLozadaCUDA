@@ -1,4 +1,6 @@
+#include <atomic>
 #include <iostream>
+#include <optional>
 #include <thread>
 #include <vector>
 #include <string>
@@ -6,9 +8,10 @@
 #include "Config.h"
 #include "EventLog.h"
 #include "Graph.h"
+#include "OrderBook.h"
 #include "SimClock.h"
 
-// TEMPORARY: stress test of the EventLog from many threads (removed later).
+// TEMPORARY: stress test of the EventLog from many threads (removed in PR 3).
 static void stress_log(const std::string& path) {
     SimClock clock(60.0);
     EventLog log(path, clock);
@@ -26,9 +29,39 @@ static void stress_log(const std::string& path) {
     std::cout << log.summaryJson() << "\n";
 }
 
+// TEMPORARY: 4 producers and 3 consumers hammer one OrderBook(50) (removed in PR 3).
+static void stress_book() {
+    OrderBook book(50);
+    std::atomic<int> accepted{0}, rejected{0}, taken{0};
+    std::vector<std::thread> consumers, producers;
+    for (int c = 0; c < 3; ++c)
+        consumers.emplace_back([&book, &taken] {
+            while (std::optional<Order> order = book.take()) taken.fetch_add(1);
+        });
+    for (int p = 0; p < 4; ++p)
+        producers.emplace_back([&book, &accepted, &rejected, p] {
+            for (int i = 0; i < 1000; ++i) {
+                Order order("o" + std::to_string(p * 1000 + i), 0, 0, 0, 0);
+                if (book.submit(std::move(order))) accepted.fetch_add(1);
+                else rejected.fetch_add(1);
+            }
+        });
+    for (std::thread& t : producers) t.join();
+    book.close();
+    for (std::thread& t : consumers) t.join();
+    std::cout << "accepted " << accepted << " rejected " << rejected << " taken " << taken
+              << " left " << book.size() << "\n";
+    std::cout << (accepted + rejected == 4000 && taken + static_cast<int>(book.size()) == accepted ? "OK" : "WRONG")
+              << "\n";
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--stress-log") {
         stress_log(argv[2]);
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--stress-book") {
+        stress_book();
         return 0;
     }
     if (argc < 2) {
@@ -57,22 +90,8 @@ int main(int argc, char** argv) {
         for (int b = 0; b < graph.nodeCount(); ++b)
             if (!graph.reachable(a, b)) ++unreachable_pairs;
     std::cout << "graph: " << graph.nodeCount() << " nodes, unreachable pairs: " << unreachable_pairs << "\n";
-    const int start = graph.indexOf(cfg.fleet.startNode);
-    for (const RestaurantDef& r : cfg.restaurants) {
-        const int to = graph.indexOf(r.node);
-        std::cout << "  " << r.name << ": " << static_cast<int>(graph.distance(start, to)) << " m, "
-                  << graph.route(start, to).size() << " nodes\n";
-    }
-    for (const StreetDef& st : cfg.streets) {
-        if (st.oneWay) {
-            const int a = graph.indexOf(st.from), b = graph.indexOf(st.to);
-            std::cout << "  one-way " << st.id << ": " << static_cast<int>(graph.distance(a, b)) << " m forward, "
-                      << static_cast<int>(graph.distance(b, a)) << " m back\n";
-            break;
-        }
-    }
 
-    // Temporary: the simulation comes in later PRs.
+    // Temporary: the simulation comes in PR 3.
     std::cout << "config OK: " << cfg.nodes.size() << " nodes, " << cfg.streets.size()
               << " streets, " << cfg.restaurants.size() << " restaurants, image " << cfg.map.image
               << ", log " << log_path << "\n";
