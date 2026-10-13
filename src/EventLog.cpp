@@ -10,7 +10,7 @@ EventLog::EventLog(const std::string& path, const SimClock& clock) : out_(path),
 }
 
 long long EventLog::emit_(const std::string& event, const Fields& fields) {
-    nlohmann::json line;
+    nlohmann::ordered_json line;   // keeps "t" and "event" first, as in the brief
     const long long t = clock_.nowMs();   // read inside the lock: t never goes backwards in the file
     line["t"] = t;
     line["event"] = event;
@@ -20,11 +20,12 @@ long long EventLog::emit_(const std::string& event, const Fields& fields) {
     return t;
 }
 
-void EventLog::orderCreated(const std::string& order, const std::string& restaurant) {
+long long EventLog::orderCreated(const std::string& order, const std::string& restaurant) {
     std::lock_guard<std::mutex> lock(mutex_);
     const long long t = emit_("orderCreated", {{"order", order}, {"restaurant", restaurant}});
     createdAt_[order] = t;
     ++counters_.created;
+    return t;
 }
 
 void EventLog::orderDelivered(const std::string& order, const std::string& courier) {
@@ -40,6 +41,11 @@ void EventLog::orderDelivered(const std::string& order, const std::string& couri
     }
 }
 
+
+void EventLog::registerCourier(const std::string& courier) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    counters_.deliveredPerCourier.emplace(courier, 0);
+}
 void EventLog::orderAssigned(const std::string& order, const std::string& courier) {
     std::lock_guard<std::mutex> lock(mutex_);
     emit_("orderAssigned", {{"order", order}, {"courier", courier}});
@@ -90,7 +96,7 @@ EventLog::Summary EventLog::summary() const {
 
 std::string EventLog::summaryJson() const {
     const Summary s = summary();
-    nlohmann::json j;
+    nlohmann::ordered_json j;   // keys in the order of the brief
     j["created"] = s.created;
     j["delivered"] = s.delivered;
     j["rejected"] = s.rejected;

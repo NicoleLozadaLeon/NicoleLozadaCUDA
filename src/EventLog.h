@@ -24,7 +24,10 @@ public:
     // Throws std::runtime_error if the file cannot be opened. `clock` must outlive the log.
     EventLog(const std::string& path, const SimClock& clock);
 
-    void orderCreated(const std::string& order, const std::string& restaurant);
+    long long orderCreated(const std::string& order, const std::string& restaurant);   // returns t
+    // Lists a courier in deliveredPerCourier with 0 deliveries (called before the threads start).
+    void registerCourier(const std::string& courier);
+    
     void orderAssigned(const std::string& order, const std::string& courier);
     void pickupStarted(const std::string& order, const std::string& courier, const std::string& restaurant);
     void orderPickedUp(const std::string& order, const std::string& courier, const std::string& restaurant);
