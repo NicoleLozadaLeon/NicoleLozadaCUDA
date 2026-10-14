@@ -8,6 +8,7 @@
 #include "Config.h"
 #include "Settings.h"
 #include "Simulation.h"
+#include "Window.h"
 namespace {
 // Set by the signal handler, read by the main loop once per frame. Inside a signal handler only
 // a LOCK-FREE atomic may be touched, so that is checked at compile time.
