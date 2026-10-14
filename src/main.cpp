@@ -8,6 +8,7 @@
 #include "Config.h"
 #include "Settings.h"
 #include "Simulation.h"
+#include "Window.h"
 namespace {
 // Set by the signal handler, read by the main loop once per frame. Inside a signal handler only
 // a LOCK-FREE atomic may be touched, so that is checked at compile time.
@@ -38,14 +39,14 @@ int main(int argc, char** argv) {
     }
     const Settings settings = Settings::fromEnvironment();   // read once, before any thread
     try {
+        Window window(cfg);   // a missing image fails here, before any simulation object exists
         Simulation sim(cfg, settings, logPath);
         std::cerr << sim.graphReport() << "\n";
         sim.start();
         std::cout << "Simulation has started..." << std::endl;
-        // TEMPORARY until the window (PR 5): one "frame" every 33 ms. A pause is allowed
-        // only to pace the frame rate; the window will replace it with cv::waitKey(33).
-        while (!g_stopRequested.load() && !sim.finished())
-            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        while (!g_stopRequested.load() && !sim.finished()) {
+            if (!window.frame(sim)) break;   // the window was closed
+        }
         sim.stop();
         std::cerr << sim.dispatcher().statsLine() << "\n";
         std::cout << sim.log().summaryJson() << std::endl;   // last line of stdout
