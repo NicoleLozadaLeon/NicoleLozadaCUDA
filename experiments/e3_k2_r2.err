@@ -1,0 +1,3 @@
+QStandardPaths: wrong permissions on runtime directory /run/user/1000/, 0755 instead of 0700
+graph: 32 nodes, shortest paths in 2.12552 ms with 20 tasks (grain 4)
+dispatcher: mode=pool K=2 rankings=229 estimates=103 late=0 failed=0 avgRankUs=71 maxRankUs=4856
