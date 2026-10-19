@@ -253,72 +253,128 @@ These are the same 3 allocations (320 bytes) that fontconfig keeps for its font 
 
 ## 7. Experiments
 
-Every experiment changes one setting and keeps the configuration, the seed and the machine the same, with 3 runs per case. The scripts are `tools/run_experiments.sh` and `tools/summarize_runs.py`. The raw logs, summaries and stderr of every run, and the full table, are in `experiments/`.
+Every experiment changes **one** setting and keeps everything else the same: the configuration file, the seed (42) and the machine (12th Gen Intel Core i9-12900H, 20 hardware threads, WSL2). Each case ran **3 times**, and the tables show the average. Every run passed `tools/check_log.py`.
 
-### E1: how the estimates are computed (design change)
+- Scripts: `tools/run_experiments.sh` runs every case, `tools/summarize_runs.py` makes the table.
+- Raw data: the event log, summary and stderr of every run are in `experiments/`, and the full table is `experiments/results.md`.
 
-- **Changed:** `EQ_ESTIMATES` = `deferred` (one after another) / `async` (one new thread per estimate) / `pool`; then `async` and `pool` with one estimate per order slowed to 500 ms.
-- **Kept equal:** `config/scenarios/fast.json`, seed 42, K = 8, `quoteTimeoutMs` = 200.
-- **Measured:** average and maximum time to rank one order (`avgRankUs`, `maxRankUs`), late estimates, delivered orders.
+What the columns mean:
+
+- **avgRankUs / maxRankUs:** average and longest time, in real microseconds, that the dispatcher needed to compare the couriers for one order (from sending the estimates until it has the ranking).
+- **late:** estimates that arrived after the `quoteTimeoutMs` deadline (200 ms), per run.
+- **delivered:** orders delivered in the run.
+- **avg / max delivery:** simulated minutes from the creation of an order to its delivery.
+
+### E1: how the estimates are computed (this experiment changed the design)
+
+- **Changed:** `EQ_ESTIMATES`:
+  - `deferred`: the estimates run one after another, on the dispatcher's own thread;
+  - `async`: one new thread per estimate (`std::async`);
+  - `pool`: the estimates go to a pool of threads created once at start-up.
+
+  Then `async` and `pool` again, with the first estimate of every order made slow on purpose (500 ms, `EQ_SLOW_ESTIMATE_MS=500`).
+- **Kept equal:** `config/scenarios/fast.json`, seed 42, K = 8 couriers compared per order, `quoteTimeoutMs` = 200 ms.
+- **Measured:** avgRankUs, maxRankUs, late estimates, delivered orders.
 
 | Case | avgRankUs | maxRankUs | late | delivered |
 |---|---|---|---|---|
-| deferred | TODO | TODO | TODO | TODO |
-| async | TODO | TODO | TODO | TODO |
-| pool | TODO | TODO | TODO | TODO |
-| async, slow estimate | TODO | TODO | TODO | TODO |
-| pool, slow estimate | TODO | TODO | TODO | TODO |
+| deferred | 4.0 | 149.0 | 0 | 54.0 |
+| async | 165.0 | 2295.3 | 0 | 53.7 |
+| pool | 55.3 | 526.7 | 0 | 53.3 |
+| async, slow estimate | 500740.7 | 500961.0 | 6.7 | 5.0 |
+| pool, slow estimate | 200248.0 | 200858.3 | 15.3 | 12.0 |
 
-> TODO: conclusion. Explain why `deferred` is the fastest with tiny estimates but breaks the brief, why the pool is faster than `async`, and why with a slow estimate `async` overshoots `quoteTimeoutMs` while the pool stays at the deadline.
+**What the numbers say:**
 
-**Design change.** TODO: before = `async`, after = `pool`, with the two numbers that justify it.
+- With normal estimates, **`deferred` is the fastest** (4 µs). Each estimate only takes a few microseconds, so creating a thread costs more than the work itself (course folder 04, example 26). But `deferred` breaks the brief: the estimates of one order must run **at the same time**, and a slow estimate would block the dispatcher with no way to stop at the deadline.
+- Between the two ways that do run the estimates at the same time, **the pool is 3 times faster than `async`** (55 µs against 165 µs), because its threads already exist.
+- With one slow estimate per order, the difference becomes large. **`async` waits 500 ms per order**: the dispatcher stops waiting at 200 ms, but a `std::async` future that is destroyed blocks until its task finishes. **The pool stops at the 200 ms deadline**, because a pool future does not block when it is dropped. In the same time, the pool delivered 12 orders against 5.
+- `late` is higher with the pool only because the pool ranked more orders in the same time; in both cases it is one late estimate per order.
+
+**Design change.** Before: one `std::async` per estimate. After: the thread pool (`src/parallel/EstimatePool.h`, course folder 09, example 55). Numbers: with a slow estimate, the time to rank one order went from **500.7 ms to 200.2 ms** (the deadline), and delivered orders went from **5.0 to 12.0**. With normal estimates it is also 3 times faster (165 µs → 55 µs).
 
 ### E2: hold the pickup slot while the food cooks, or wait for the food first
 
-- **Changed:** `EQ_FOOD_WAIT` = `holding` / `before`.
-- **Kept equal:** `config/scenarios/one_slot.json` (one slot per restaurant), seed 42.
-- **Measured:** delivered orders, average and maximum delivery time.
+- **Changed:** `EQ_FOOD_WAIT`:
+  - `holding`: the courier takes a pickup slot and waits there until the food is ready;
+  - `before`: the courier waits for the food first, and takes a slot only when it is ready.
+- **Kept equal:** `config/scenarios/one_slot.json` (one pickup slot per restaurant), seed 42.
+- **Measured:** delivered orders, average and longest delivery time.
 
 | Case | delivered | avg delivery (min) | max delivery (min) |
 |---|---|---|---|
-| holding | TODO | TODO | TODO |
-| before | TODO | TODO | TODO |
+| holding | 45.0 | 8.3 | 17.6 |
+| before | 42.0 | 7.7 | 18.6 |
 
-> TODO: conclusion. Be honest if the difference is inside the run-to-run noise.
+**What the numbers say:** the result is mixed. `before` has a shorter average delivery time, but `holding` delivered a few more orders and has a shorter maximum. The differences are small, about the size of the differences between the 3 runs of the same case. In this scenario the preparation times (1 to 4 simulated minutes) are short compared with the time couriers spend riding, so a slot is rarely held for long. **Conclusion:** this experiment does not show that one design is better, so it did not lead to a change. I kept `before`, because it never blocks a slot while nothing can be collected; a scenario with longer preparation times would be needed to measure that effect.
 
-### E3: number of candidates compared per order (K)
+### E3: how many couriers are compared for each order (K)
 
 - **Changed:** `EQ_CANDIDATES` = 1, 2, 4, 8, 16.
-- **Kept equal:** `config/scenarios/fast.json`, seed 42, pool mode.
-- **Measured:** `avgRankUs`, delivered orders, average delivery time.
+- **Kept equal:** `config/scenarios/fast.json` (8 couriers), seed 42, pool mode.
+- **Measured:** avgRankUs, delivered orders, average delivery time.
 
 | K | avgRankUs | delivered | avg delivery (min) |
 |---|---|---|---|
-| 1 | TODO | TODO | TODO |
-| 2 | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO |
-| 16 | TODO | TODO | TODO |
+| 1 | 60.3 | 54.7 | 13.1 |
+| 2 | 59.7 | 56.3 | 13.2 |
+| 4 | 57.0 | 54.7 | 13.0 |
+| 8 | 59.0 | 54.3 | 13.6 |
+| 16 | 64.3 | 52.3 | 13.5 |
 
-> TODO: conclusion.
+**What the numbers say:** K has no visible effect here. The time to rank an order stays near 60 µs, and the deliveries stay between 52 and 56 orders at about 13 minutes. With only 8 couriers, and most of them busy, there are few free couriers to choose from, so comparing more of them changes little. Because the estimates run at the same time on the pool, comparing more couriers also costs almost nothing. **Conclusion:** K = 8 is a safe default; it neither helps nor hurts with this fleet.
 
-### E4: parallel start-up of the shortest-path tables
+### E4: building the shortest-path tables in parallel at start-up
 
-- **Changed:** `EQ_GRAPH_TASKS` = 1, 2, 4, 8, 16 (dynamic chunks), and 8 tasks with static chunks (`EQ_GRAPH_GRAIN=0`).
-- **Kept equal:** a 40 x 40 grid (1600 nodes, 3120 streets, `config/scenarios/grid40.json`), the machine (TODO: cores / `hardware_concurrency()`).
-- **Measured:** time to build the tables (`graph:` line on stderr), speedup = T(1) / T(n), Amdahl's prediction 1 / (f + (1 − f) / n).
+- **Changed:** `EQ_GRAPH_TASKS` = 1, 2, 4, 8, 16 tasks (dynamic chunks of 4 nodes), and 8 tasks with static chunks (`EQ_GRAPH_GRAIN=0`).
+- **Kept equal:** a 40 × 40 grid of streets (1600 nodes, 3120 streets, `config/scenarios/grid40.json`), the machine.
+- **Measured:** time to build the tables (the `graph:` line printed at start-up), the speedup T(1) / T(n), and Amdahl's prediction 1 / (f + (1 − f) / n).
 
-| Tasks | time (ms) | speedup | Amdahl |
+| Tasks | time (ms) | speedup | Amdahl (f = 0.13) |
 |---|---|---|---|
-| 1 | TODO | 1.0 | 1.0 |
-| 2 | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO |
-| 16 | TODO | TODO | TODO |
-| 8, static chunks | TODO | TODO | – |
+| 1 | 304.9 | 1.00 | 1.00 |
+| 2 | 149.3 | 2.04 | 1.77 |
+| 4 | 82.9 | 3.68 | 2.89 |
+| 8 | 72.1 | 4.23 | 4.21 |
+| 16 | 55.8 | 5.46 | 5.46 |
+| 8, static chunks | 68.9 | 4.43 | – |
 
-> TODO: conclusion. How you estimated the serial fraction f, why the speedup flattens, and what static vs dynamic chunks show on a grid where every source costs the same.
+**How I estimated f (the part that cannot run in parallel):** from the 16-task point, T(16) / T(1) = 55.8 / 304.9 = 0.183 = f + (1 − f) / 16, which gives f ≈ 0.13. So, according to Amdahl's law, no number of tasks can make this more than 1 / f ≈ 7.8 times faster.
+
+**What the numbers say:**
+
+- The speedup grows quickly up to 4 tasks, then flattens: 8 tasks are only a little faster than 4, and 16 give 5.5×, far from 16×. That is the curve Amdahl's law predicts.
+- Up to 4 tasks the measurements are better than the prediction. One f estimated from a single point is only an approximation; the processor also has cores of two different speeds and hyper-threads that share a core, so the extra threads beyond the fastest cores add less.
+- Static chunks (68.9 ms) were slightly faster than dynamic chunks (72.1 ms) here. On a regular grid, every node costs about the same, so equal static chunks are already balanced and the shared counter of the dynamic version only adds a little overhead. Dynamic chunks pay off when some nodes cost much more than others (course folder 10, example 60), which can happen on a real map with one-way streets.
+- On the real map (32 nodes) the whole build takes about 2 ms, so the parallel start-up matters for the large maps the reviewers use, not for ours.
 
 ## 8. Map and data
 
-The background image and the street network come from OpenStreetMap (© OpenStreetMap contributors, ODbL). Details of the bounding box, the tools used to trace the network, and the restaurant positions are in `data/README.md`.
+All map data comes from **OpenStreetMap** (© OpenStreetMap contributors, data under the ODbL). The attribution is shown in the bottom-right corner of the window and in this report.
+
+**The image** (`data/equipetrol.png`): exported from openstreetmap.org (Share → Image, Standard layer), PNG, 1248 × 1792 pixels, scale 1:5700, Web Mercator projection. It shows Zona Equipetrol from the **Cuarto Anillo** (Av. Antonio Vaca Díez, at the top) through the **Tercer Anillo** (Av. Noel Kempff Mercado) down to the **Segundo Anillo** (Av. Cristóbal de Mendoza, bottom right), with **Av. San Martín** crossing it, and Av. La Salle and Av. Busch.
+
+**Bounding box** (decimal degrees, also in `map.bounds` of `config/equipetrol.json`):
+
+| north | south | west | east |
+|---|---|---|---|
+| −17.750567044823004 | −17.77504707884483 | −63.205248240852164 | −63.187351138452286 |
+
+The window turns a latitude and longitude into a pixel with these bounds: longitude linearly, latitude with the Web Mercator formula, the same projection as the image.
+
+**Simulated zone.** As agreed with the teacher, the street network and the restaurants cover the east side of Av. San Martín (between Av. San Martín and Av. La Salle), from the Cuarto Anillo to the Segundo Anillo. The image is not cropped.
+
+**Street network** (`config/equipetrol.json`): **32 intersections and 44 street segments**, 4 of them one-way, traced on the real streets of the image (`tools/pick_network.py`, checked with `tools/check_network.py`). The brief asks for at least 25 intersections, 40 segments and 6 restaurants. Every pair of intersections can reach each other through the streets.
+
+**Restaurants:** 6 real places taken from OpenStreetMap (`data/restaurants_osm.csv`, exported with Overpass Turbo). Each one sits on the intersection closest to its real position, except Ambika (see the table).
+
+| Restaurant | Intersection | Pickup slots | Distance from its real position |
+|---|---|---|---|
+| Tradiciones | n29 | 1 | 28 m |
+| Pizza Hut | n10 | 2 | 17 m |
+| Ambika | n24 | 1 | 60 m (moved to a nearby intersection, with the teacher's permission) |
+| Menta | n27 | 2 | 17 m |
+| Yogen Früz | n26 | 1 | 14 m |
+| Sushi Bar by Slätkis | n25 | 2 | 20 m |
+
+More notes on the export and the restaurant list are in `data/README.md`.
