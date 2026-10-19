@@ -60,7 +60,7 @@ The command line is exactly the one of the brief. The experiments change the des
 ### Tests
 
 ```sh
-python3 tools/make_test_configs.py                     # scenarios of section 11 of the brief
+python3 tools/make_test_configs.py                     
 tools/run_scenario.sh build-tsan/delivery_sim config/scenarios/stress.json stress 0
 tools/run_scenario.sh build/delivery_sim config/equipetrol.json real 8 INT
 python3 tools/check_log.py runs/real.log runs/real.summary config/equipetrol.json
@@ -121,7 +121,20 @@ flowchart TB
   M -.->|"snapshots: view(), deliveryNodes(), summary()"| C
 ```
 
-> TODO: under the diagram, explain in a few sentences: (1) what each thread waits on when it has nothing to do, (2) the shutdown order in `Simulation::stop()` and why the generator stops first, (3) the lock order: which operation holds two locks and why it cannot deadlock.
+**When a thread has nothing to do, it sleeps.** No thread ever loops asking "is there work yet?". Each one waits on something that wakes it up:
+
+- A **courier** with an empty bag sleeps on its own condition variable (`Courier::nextTask()`). The dispatcher wakes it when it gives it an order.
+- The **dispatcher** sleeps in `OrderBook::take()` until an order arrives. If no courier can take an order yet, it sleeps in `Fleet::waitForChange()` until a courier gets room in its bag or is repaired.
+- The **order generator** sleeps until the moment of the next order (`wait_until`).
+- The **pool workers** sleep until the dispatcher puts an estimate in their queue.
+- The **main thread** draws one frame of the window every 33 ms.
+
+**How the program stops.** On Ctrl+C, SIGTERM, the end of the run or closing the window, `Simulation::stop()` stops everything in this order:
+
+1. It stops the order generator first, so no new orders appear while the rest is shutting down.
+2. It wakes every sleeping thread: it closes the order book, stops the fleet and every courier, and stops the restaurants.
+3. It waits for every thread to finish (`join`): the dispatcher, all couriers and the pool workers.
+4. It writes `simulationStopping` as the last line of the log. Orders that were not finished are counted as `pending` in the summary.
 
 ## 4. Concept map
 
