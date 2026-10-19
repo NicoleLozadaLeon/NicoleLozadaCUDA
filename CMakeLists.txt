@@ -27,10 +27,12 @@ target_include_directories(delivery_sim SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS} ${
 target_link_libraries(delivery_sim PRIVATE ${OpenCV_LIBS} Threads::Threads)
 if(ENABLE_TSAN)
   target_compile_options(delivery_sim PRIVATE -fsanitize=thread -g -O1 -fno-omit-frame-pointer)
+  target_compile_definitions(delivery_sim PRIVATE DELIVERY_SIM_TSAN)
   target_link_libraries(delivery_sim PRIVATE -fsanitize=thread)
 endif()
 
 if(ENABLE_ASAN)
   target_compile_options(delivery_sim PRIVATE -fsanitize=address,undefined -g -O1 -fno-omit-frame-pointer)
+  target_compile_definitions(delivery_sim PRIVATE DELIVERY_SIM_ASAN)
   target_link_libraries(delivery_sim PRIVATE -fsanitize=address,undefined)
 endif()
