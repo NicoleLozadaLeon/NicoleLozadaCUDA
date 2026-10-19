@@ -1,12 +1,12 @@
-# Equipetrol Delivery: a Concurrent Dispatch Simulation
+# Equipetrol Delivery
 
 Map data © OpenStreetMap contributors (ODbL).
 
-> TODO: one paragraph in your own words: what the program simulates (couriers, restaurants, dispatcher, orders in Zona Equipetrol) and what the concurrency is for.
+This program simulates couriers, restaurants, a dispatcher and orders in Zona Equipetrol, in accelerated time and drawn live over the real OpenStreetMap image of the zone. Every courier, the dispatcher and the order generator run at the same time on their own threads, and the estimates for each order are computed in parallel by a thread pool. The goal is to serve the orders without losing, duplicating or corrupting any, which is checked with ThreadSanitizer and a log checker.
 
 ![The simulation window](docs/window.png)
 
-> TODO: take a screenshot of the running window, save it as `docs/window.png`, and add it in the same commit.
+
 
 ## 1. Build and run
 
