@@ -6,7 +6,7 @@ This program simulates couriers, restaurants, a dispatcher and orders in Zona Eq
 
 ![The simulation window](docs/window.png)
 
-
+The same report as a PDF: [docs/final_report.pdf](docs/final_report.pdf).
 
 ## 1. Build and run
 
