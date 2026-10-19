@@ -163,49 +163,52 @@ The project also uses folders 08 to 10 of the course. Folder 08: the flag set by
 
 ## 5. Why there is no data race
 
+A data race needs two threads touching the same memory at the same time, with at least one of them writing, and nothing ordering them. For every shared object, one of these four reasons makes that impossible: it is **only read** during the run, it is **only touched while holding its lock**, each thread has **its own copy**, or it is an **atomic**.
+
 | Shared object | Shared by | Why no data race is possible |
 |---|---|---|
-| `Config`, `Settings` | every thread | TODO |
-| `Graph` | couriers, dispatcher, estimate tasks, generator, window | TODO |
-| `SimClock` | every thread | TODO |
-| `EventLog` | generator, dispatcher, couriers, main | TODO |
-| `OrderBook` | generator, dispatcher, window | TODO |
-| `Restaurant` | couriers | TODO |
-| `Courier` (bag, position, state) | its own thread, dispatcher, other couriers (handover), window | TODO |
-| `Fleet` (version counter, courier list) | dispatcher, couriers | TODO |
-| `EstimatePool` job queue | dispatcher, pool workers | TODO |
-| `Courier::View` and the estimate inputs | estimate tasks, window | TODO |
-| `g_stopRequested`, dispatcher statistics | signal handler, main, dispatcher | TODO |
-| random generators | generator thread, each courier thread, dispatcher | TODO |
-| rows of `dist_` / `next_` during start-up | shortest-path tasks | TODO |
+| `Config`, `Settings` | every thread | Filled once in `main` before any thread starts. After that, threads only read them, and reading alone can never race. |
+| `Graph` | couriers, dispatcher, estimate tasks, generator, window | Built completely in the `Simulation` constructor before the simulation threads start. After that every method is `const`, so it is only read. |
+| `SimClock` | every thread | Its two members are `const` and set in the constructor. Its methods only read them. |
+| `EventLog` | generator, dispatcher, couriers, main | Every method takes the log's mutex before writing a line or changing a counter, and the summary is read under the same mutex. |
+| `OrderBook` | generator, dispatcher, window | Every method (`submit`, `take`, `close`, `size`, `deliveryNodes`) takes its mutex before touching the queue. |
+| `Restaurant` | couriers | The slots and the ticket counters change only under the restaurant's mutex. Its id, name and node never change after construction. |
+| `Courier` (bag, position, state) | its own thread, dispatcher, other couriers (handover), window | Changed only under the courier's mutex. Other threads read a copy made under that mutex (`view()`), and a handover locks both couriers. The courier's own thread may read its own position without the lock, because it is the only thread that writes it. |
+| `Order` | generator, dispatcher, couriers | An order has exactly one owner at a time. It is moved, never copied, and only while holding the lock of the place it moves into (the order book or a bag). |
+| `Fleet` (change counter, courier list) | dispatcher, couriers | The change counter and the stop flag change only under the fleet's mutex. The list of couriers is filled in the constructor and never changes. |
+| `EstimatePool` job queue | dispatcher, pool workers | Jobs are added and removed only under the pool's mutex. Each job then runs outside the lock, on its own copies. |
+| `Courier::View` and the estimate inputs | estimate tasks, window | Copies made under the courier's lock. Each task owns its copies, and the only shared thing it reads is the `const` `Graph`. |
+| `g_stopRequested`, dispatcher statistics | signal handler, main, dispatcher | `std::atomic`: every read and write is indivisible. The stop flag is lock-free, so it is safe even inside the signal handler. The statistics are written only by the dispatcher and read by the window. |
+| random generators | generator thread, each courier thread, dispatcher | Each generator belongs to exactly one thread and is never shared. |
+| rows of `dist_` / `next_` during start-up | shortest-path tasks | The tables are sized before the tasks start, and each row is written by exactly one task: the one that claimed that node with `fetch_add`. Different rows are different memory. Every task has finished (`get()`) before anyone reads the tables. |
 
-ThreadSanitizer reported no race in any scenario (section 6).
+ThreadSanitizer confirms it: after the fix described in section 6, it reported no race in any run.
 
 ## 6. Analysis with tools
 
-Each tool observed a complete run of `config/equipetrol.json` with bursts of orders, breakdowns and a stop by signal. The unedited output of every run is in `analysis/`.
+I used two tools that come with g++ 15.2.0 (`analysis/versions.txt`):
 
-### ThreadSanitizer (races)
+- **ThreadSanitizer (TSan)**, which looks for **data races** and lock-order problems;
+- **AddressSanitizer + LeakSanitizer + UndefinedBehaviorSanitizer (ASan)**, which look for **memory errors, leaks** and undefined behaviour.
 
-- **Version:** TODO (`g++ --version`)
-- **Command:** TODO (copy the exact command)
-- **Run checked:** TODO (number of orders, bursts and breakdowns in that log; the signal used)
-- **What it reported:** TODO
-- **What I changed:** TODO
-- **Result of the re-run:** TODO
-- **Output files:** `analysis/TODO`
+Each one watched a **complete run of `config/equipetrol.json`** that had bursts of orders, a breakdown and a stop by signal. The unedited output of every run is in `analysis/`.
 
-### AddressSanitizer + LeakSanitizer (memory)
+### What the full runs contained
 
-- **Version:** TODO
-- **Command:** TODO
-- **Run checked:** TODO
-- **What it reported:** TODO
-- **What I changed:** TODO
-- **Result of the re-run:** TODO
-- **Output files:** `analysis/TODO`
+| Run | Orders | Delivered | Pending | Bursts | Breakdowns | Stopped by |
+|---|---|---|---|---|---|---|
+| TSan full (`tsan_full`) | 127 | 90 | 37 | 29 orders arrived less than 200 simulated ms after the previous one | 1 | SIGINT after 55 s |
+| ASan full (`asan_full`) | 127 | 90 | 37 | same 29 (same seed) | 1 | SIGINT after 55 s |
 
-> TODO: list and explain every report that remains in the final version (for example, memory held by OpenCV, GTK or fontconfig until exit). An unexplained report counts as a defect.
+I also ran both tools on the hardest scenarios: `stress` (1933 orders, 162 breakdowns, 134 reassigned orders, bag of 1, one pickup slot) and, for ASan, `breakdowns` stopped with SIGTERM (470 orders, 37 breakdowns).
+
+### ThreadSanitizer (data races)
+
+- **Version:** g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0, which includes TSan.
+- **Commands:**
+  ```sh
+  mkdir build-tsan && cd build-tsan && cmake -DENABLE_TSAN=ON .. && make && cd ..
+  tools/run_scenario.sh build-tsan/delivery_sim config/equipetrol.json tsan_full 55 INT
 
 ## 7. Experiments
 
