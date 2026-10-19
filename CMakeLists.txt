@@ -17,9 +17,9 @@ endif()
 find_package(Threads REQUIRED)
 find_package(OpenCV 4.1 REQUIRED COMPONENTS core imgproc imgcodecs highgui)
 
-file(GLOB SOURCES src/*.cpp)
+file(GLOB_RECURSE SOURCES src/*.cpp)
 add_executable(delivery_sim ${SOURCES})
-
+target_include_directories(delivery_sim PRIVATE src/core src/shared src/actors src/parallel src/app src/view)
 target_compile_options(delivery_sim PRIVATE -Wall -Wextra)
 
 target_include_directories(delivery_sim SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/third_party)
