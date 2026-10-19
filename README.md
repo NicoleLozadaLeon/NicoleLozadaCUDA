@@ -204,11 +204,52 @@ I also ran both tools on the hardest scenarios: `stress` (1933 orders, 162 break
 
 ### ThreadSanitizer (data races)
 
-- **Version:** g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0, which includes TSan.
-- **Commands:**
-  ```sh
-  mkdir build-tsan && cd build-tsan && cmake -DENABLE_TSAN=ON .. && make && cd ..
-  tools/run_scenario.sh build-tsan/delivery_sim config/equipetrol.json tsan_full 55 INT
+**Version:** g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0, which includes TSan.
+
+**Commands:**
+
+```sh
+mkdir build-tsan && cd build-tsan && cmake -DENABLE_TSAN=ON .. && make && cd ..
+tools/run_scenario.sh build-tsan/delivery_sim config/equipetrol.json tsan_full 55 INT
+```
+
+**What it reported (before):** 5 warnings (`analysis/tsan_before.txt`): 4 data races and 1 lock-order inversion. All of them were **inside the libraries of the window**: 3 in `libQt5Core` and 2 in `libdbus`, in a thread called `QDBusConnection` that Qt starts by itself when OpenCV opens the window. None of them involved the simulation's own data; the only line of my code in those reports is the creation of the window in `main`.
+
+**What I changed** (commit `9e7125a`):
+
+1. `cv::setNumThreads(0)` in the `Window` constructor. OpenCV no longer starts its own hidden pool of worker threads (TBB) for image operations, so every thread that works on the simulation is one that my program creates and joins.
+2. A short list of **suppressions** compiled into the TSan build only (`src/app/SanitizerSuppressions.cpp`). It tells TSan to ignore reports *inside* the GUI libraries (Qt, dbus, glib, GTK, X11). TSan cannot see how those libraries synchronise internally, because they were not compiled with it. A race in my own code would still be reported, because its stack would not be made only of those libraries.
+
+**Result of the re-run:** **0 warnings** in the full run and in `stress` (`analysis/tsan_full.txt`, `analysis/tsan_stress.txt`). Both runs passed `tools/check_log.py`.
+
+### AddressSanitizer + LeakSanitizer + UBSan (memory)
+
+**Version:** g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0, which includes ASan, LSan and UBSan.
+
+**Commands:**
+
+```sh
+mkdir build-asan && cd build-asan && cmake -DENABLE_ASAN=ON .. && make && cd ..
+tools/run_scenario.sh build-asan/delivery_sim config/equipetrol.json asan_full 55 INT
+```
+
+**What it reported (before):** no memory errors and no undefined behaviour, but LeakSanitizer found **320 bytes leaked in 3 allocations**, and that made the exit status 1 (`analysis/asan_before.txt`). All three allocations were made by **`libfontconfig`** (`FcInit`), called by Qt's font database the first time the window draws text. Fontconfig loads its font list once and keeps it until the program ends; it is not memory my code allocated.
+
+**What I changed** (same commit `9e7125a`): the same file, `src/app/SanitizerSuppressions.cpp`, also gives LeakSanitizer a list of the same GUI libraries, compiled into the ASan build only. A leak in my own code would still be reported.
+
+**Result of the re-run:** exit status **0** and **no errors** in the full run (SIGINT), in `stress`, and in `breakdowns` (SIGTERM) (`analysis/asan_full.txt`, `asan_stress.txt`, `asan_bd.txt`). All three passed `tools/check_log.py`.
+
+### What the tools still print, and why
+
+The only thing left in the final version is this block at the end of the ASan output:
+
+```
+Suppressions used:
+  count      bytes template
+      3        320 libfontconfig.so
+```
+
+These are the same 3 allocations (320 bytes) that fontconfig keeps for its font list until the program exits, as explained above. Nothing else is reported: no data race, no memory error, no leak in the simulation's code.
 
 ## 7. Experiments
 
