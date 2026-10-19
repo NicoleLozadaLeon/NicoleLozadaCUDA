@@ -31,6 +31,4 @@ struct Config {
     SimulationDef simulation;
 };
 
-// Throws ConfigError with a readable message on any problem.
-// The returned map.image path is already resolved relative to the config file.
 Config load_config(const std::string& path);

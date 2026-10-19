@@ -2,14 +2,12 @@
 #include <string>
 #include <utility>
 
-// An order exists in exactly one place at a time: the generator, the OrderBook,
-// the dispatcher or one courier's bag. It can be moved, never copied.
 struct Order {
     std::string id;
-    int restaurant;          // index into Config::restaurants
-    int deliveryNode;        // Graph node index of the customer
-    long long createdAtMs;   // simulated ms
-    long long prepMs;        // preparation time drawn by the generator
+    int restaurant;
+    int deliveryNode;
+    long long createdAtMs;
+    long long prepMs;
 
     Order(std::string id_, int restaurant_, int deliveryNode_, long long createdAtMs_, long long prepMs_)
         : id(std::move(id_)), restaurant(restaurant_), deliveryNode(deliveryNode_),
@@ -21,4 +19,3 @@ struct Order {
     Order& operator=(Order&&) noexcept = default;
     ~Order() = default;
 };
-

@@ -8,10 +8,6 @@
 #include <queue>
 #include <thread>
 #include <vector>
-// A fixed set of worker threads fed from a monitor queue (mutex + condition variable).
-// submit() wraps each job in a std::packaged_task, so the caller gets a std::future with the
-// result or the exception. Unlike a std::async future, a packaged_task future does NOT block
-// in its destructor, so the dispatcher can walk away from a late estimate.
 class EstimatePool {
 public:
     explicit EstimatePool(std::size_t workers) {
@@ -23,7 +19,6 @@ public:
     template <class Fn>
     auto submit(Fn fn) -> std::future<decltype(fn())> {
         using R = decltype(fn());
-        // packaged_task is move-only; the queue stores copyable std::function, so share it.
         auto task = std::make_shared<std::packaged_task<R()>>(std::move(fn));
         std::future<R> result = task->get_future();
         {
@@ -33,8 +28,6 @@ public:
         cond_.notify_one();
         return result;
     }
-    // Wakes every worker and joins them all. Jobs still queued are dropped: the simulation is
-    // stopping and nobody waits for them (the pool of the course drains them instead).
     void shutdown() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -56,7 +49,7 @@ private:
                 job = std::move(jobs_.front());
                 jobs_.pop();
             }
-            job();   // run OUTSIDE the lock
+            job();
         }
     }
     std::vector<std::thread> workers_;

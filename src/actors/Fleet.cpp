@@ -18,7 +18,7 @@ void Fleet::notifyChanged() {
         std::lock_guard<std::mutex> lock(mutex_);
         ++version_;
     }
-    changed_.notify_all();   // the dispatcher AND broken couriers may be waiting
+    changed_.notify_all();
 }
 bool Fleet::waitForChange(unsigned long long seen, SimClock::Clock::time_point deadline) {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -31,13 +31,13 @@ bool Fleet::handOver(Courier& from) {
     std::vector<std::pair<double, std::shared_ptr<Courier>>> receivers;
     for (const std::shared_ptr<Courier>& c : couriers_) {
         if (c.get() == &from) continue;
-        const Courier::View v = c->view();   // one lock at a time
+        const Courier::View v = c->view();
         if (v.available) receivers.push_back({graph_.distance(v.legTo, me.legTo), c});
     }
     std::sort(receivers.begin(), receivers.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     for (const auto& receiver : receivers)
-        if (Courier::transferAll(from, *receiver.second, log_)) return true;   // re-checked under both locks
+        if (Courier::transferAll(from, *receiver.second, log_)) return true;
     return false;
 }
 void Fleet::stop() {

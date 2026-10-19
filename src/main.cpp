@@ -10,8 +10,6 @@
 #include "Simulation.h"
 #include "Window.h"
 namespace {
-// Set by the signal handler, read by the main loop once per frame. Inside a signal handler only
-// a LOCK-FREE atomic may be touched, so that is checked at compile time.
 std::atomic<bool> g_stopRequested{false};
 static_assert(std::atomic<bool>::is_always_lock_free, "the stop flag must be lock-free");
 void onSignal(int) { g_stopRequested.store(true); }
@@ -19,9 +17,8 @@ int usage() {
     std::cerr << "usage: delivery_sim <config.json> [--log <path>]\n";
     return 1;
 }
-}  // namespace
+}
 int main(int argc, char** argv) {
-    // First thing: a signal that arrives at any later moment only sets the flag.
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     if (argc != 2 && argc != 4) return usage();
@@ -37,19 +34,19 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << e.what() << "\n";
         return 1;
     }
-    const Settings settings = Settings::fromEnvironment();   // read once, before any thread
+    const Settings settings = Settings::fromEnvironment();
     try {
-        Window window(cfg);   // a missing image fails here, before any simulation object exists
+        Window window(cfg);
         Simulation sim(cfg, settings, logPath);
         std::cerr << sim.graphReport() << "\n";
         sim.start();
         std::cout << "Simulation has started..." << std::endl;
         while (!g_stopRequested.load() && !sim.finished()) {
-            if (!window.frame(sim)) break;   // the window was closed
+            if (!window.frame(sim)) break;
         }
         sim.stop();
         std::cerr << sim.dispatcher().statsLine() << "\n";
-        std::cout << sim.log().summaryJson() << std::endl;   // last line of stdout
+        std::cout << sim.log().summaryJson() << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return 1;

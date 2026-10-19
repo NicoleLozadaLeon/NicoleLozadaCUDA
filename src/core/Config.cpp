@@ -9,7 +9,6 @@ namespace {
 
 using json = nlohmann::json;
 
-// Reads j.at(key) as T. A missing key or a wrong type becomes a ConfigError naming the key.
 template <typename T>
 T require(const json& j, const char* key, const std::string& where) {
     try {
@@ -19,7 +18,6 @@ T require(const json& j, const char* key, const std::string& where) {
     }
 }
 
-// Returns j.at(key) after checking it is an object (or an array).
 const json& require_object(const json& j, const char* key, const char* where) {
     if (!j.is_object() || !j.contains(key) || !j.at(key).is_object())
         throw ConfigError(std::string(where) + ": missing or invalid object '" + key + "'");
@@ -32,13 +30,12 @@ const json& require_array(const json& j, const char* key, const char* where) {
     return j.at(key);
 }
 
-// Folder of the config file, with a trailing slash ("" if the path has no folder).
 std::string folder_of(const std::string& path) {
     const auto pos = path.find_last_of("/\\");
     return pos == std::string::npos ? std::string() : path.substr(0, pos + 1);
 }
 
-}  // namespace
+}
 
 Config load_config(const std::string& path) {
     std::ifstream in(path);

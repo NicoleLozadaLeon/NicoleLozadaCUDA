@@ -10,8 +10,8 @@ EventLog::EventLog(const std::string& path, const SimClock& clock) : out_(path),
 }
 
 long long EventLog::emit_(const std::string& event, const Fields& fields) {
-    nlohmann::ordered_json line;   // keeps "t" and "event" first, as in the brief
-    const long long t = clock_.nowMs();   // read inside the lock: t never goes backwards in the file
+    nlohmann::ordered_json line;
+    const long long t = clock_.nowMs();
     line["t"] = t;
     line["event"] = event;
     for (const auto& f : fields) line[f.first] = f.second;
@@ -40,7 +40,6 @@ void EventLog::orderDelivered(const std::string& order, const std::string& couri
         counters_.maxDeliveryMs = std::max(counters_.maxDeliveryMs, duration);
     }
 }
-
 
 void EventLog::registerCourier(const std::string& courier) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -96,7 +95,7 @@ EventLog::Summary EventLog::summary() const {
 
 std::string EventLog::summaryJson() const {
     const Summary s = summary();
-    nlohmann::ordered_json j;   // keys in the order of the brief
+    nlohmann::ordered_json j;
     j["created"] = s.created;
     j["delivered"] = s.delivered;
     j["rejected"] = s.rejected;

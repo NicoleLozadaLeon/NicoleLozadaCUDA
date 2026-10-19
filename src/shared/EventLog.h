@@ -9,9 +9,6 @@
 
 #include "SimClock.h"
 
-// Monitor: one mutex protects the file AND the summary counters, so a line and
-// the counter it changes always change together. It is the innermost lock of the
-// program: no method calls anything that takes another lock.
 class EventLog {
 public:
     struct Summary {
@@ -21,13 +18,11 @@ public:
         std::map<std::string, long long> deliveredPerCourier;
     };
 
-    // Throws std::runtime_error if the file cannot be opened. `clock` must outlive the log.
     EventLog(const std::string& path, const SimClock& clock);
 
-    long long orderCreated(const std::string& order, const std::string& restaurant);   // returns t
-    // Lists a courier in deliveredPerCourier with 0 deliveries (called before the threads start).
+    long long orderCreated(const std::string& order, const std::string& restaurant);
     void registerCourier(const std::string& courier);
-    
+
     void orderAssigned(const std::string& order, const std::string& courier);
     void pickupStarted(const std::string& order, const std::string& courier, const std::string& restaurant);
     void orderPickedUp(const std::string& order, const std::string& courier, const std::string& restaurant);
@@ -37,12 +32,11 @@ public:
     void orderReassigned(const std::string& order, const std::string& from, const std::string& to);
     void simulationStopping();
 
-    Summary summary() const;          // a consistent snapshot, taken under the lock
-    std::string summaryJson() const;  // the last line printed on stdout
+    Summary summary() const;
+    std::string summaryJson() const;
 
 private:
     using Fields = std::vector<std::pair<std::string, std::string>>;
-    // Writes one line and returns its time t. The caller MUST already hold mutex_.
     long long emit_(const std::string& event, const Fields& fields);
 
     mutable std::mutex mutex_;

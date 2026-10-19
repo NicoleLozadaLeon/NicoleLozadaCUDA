@@ -2,19 +2,15 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
-// Knobs for the experiments of DP.10. They come from environment variables so that the
-// command line stays exactly as the brief defines it. main() reads them ONCE, before any
-// thread exists; afterwards the object is only read, so sharing it by const reference
-// cannot race. With no variable set, every knob has the value of the final design.
 struct Settings {
     enum class Estimates { Pool, Async, Deferred };
-    Estimates estimates = Estimates::Pool;   // EQ_ESTIMATES = pool | async | deferred
-    int candidates = 8;                      // EQ_CANDIDATES: couriers compared for one order (K)
-    bool holdSlotWhileCooking = false;       // EQ_FOOD_WAIT = holding | before
-    int slowEstimateMs = 0;                  // EQ_SLOW_ESTIMATE_MS: first estimate of each order is this slow (real ms)
-    double failEstimateProbability = 0.0;    // EQ_FAIL_ESTIMATE: chance that one estimate throws
-    int graphTasks = 0;                      // EQ_GRAPH_TASKS: 0 = hardware_concurrency()
-    int graphGrain = 4;                      // EQ_GRAPH_GRAIN: sources claimed at a time, 0 = static chunks
+    Estimates estimates = Estimates::Pool;
+    int candidates = 8;
+    bool holdSlotWhileCooking = false;
+    int slowEstimateMs = 0;
+    double failEstimateProbability = 0.0;
+    int graphTasks = 0;
+    int graphGrain = 4;
     const char* estimatesName() const {
         switch (estimates) {
             case Estimates::Async: return "async";
