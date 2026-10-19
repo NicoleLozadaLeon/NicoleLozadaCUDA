@@ -12,15 +12,16 @@ This program simulates couriers, restaurants, a dispatcher and orders in Zona Eq
 
 Dependencies (the versions I used):
 
-| Tool / library | Version |
-|---|---|
-| g++ | 15.2.0 |
-| CMake | 4.2.3 |
-| GNU make | 4.4.1 |
-| OpenCV | 4.10.0 |
-| nlohmann/json (vendored in `third_party/`) | 3.11.3 |
-| Python (tools only) | 3.14 |
-| Valgrind (if used in section 6) | 3.26 |
+| Tool / library | Version | Used for |
+|---|---|---|
+| Ubuntu (WSL2, kernel 6.6.87.2) | 26.04.1 LTS | build and run environment |
+| g++ (includes ThreadSanitizer, AddressSanitizer, LeakSanitizer, UBSan) | 15.2.0 | compiler and the tools of section 6 |
+| CMake | 4.2.3 | build |
+| GNU make | 4.4.1 | build |
+| OpenCV | 4.10.0 | the window only |
+| Qt5 (OpenCV's window backend on this system) | 5.15.18 | pulled in by OpenCV, not used directly |
+| nlohmann/json (vendored in `third_party/`) | 3.11.3 | reading the config, writing the log |
+| Python | 3.14.4 | tools only (log checker, experiments) |
 
 Build and run exactly as the brief says:
 
