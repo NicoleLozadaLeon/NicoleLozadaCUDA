@@ -11,14 +11,12 @@ std::vector<std::shared_ptr<Restaurant>> makeRestaurants(const Config& cfg, cons
         restaurants.push_back(std::make_shared<Restaurant>(r.id, r.name, graph.indexOf(r.node), r.pickupSlots));
     return restaurants;
 }
-// All K estimates of one order must be able to run at the same time, and there is no gain in
-// more busy threads than cores: the pool gets max(cores, K) workers.
 std::size_t poolSize(const Settings& settings) {
-    unsigned hw = std::thread::hardware_concurrency();   // 0 means unknown
+    unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 2;
     return std::max<std::size_t>(hw, static_cast<std::size_t>(settings.candidates));
 }
-}  // namespace
+}
 Simulation::Simulation(const Config& cfg, const Settings& settings, const std::string& logPath)
     : cfg_(cfg),
       graph_(cfg, settings.graphTasks, settings.graphGrain),
@@ -37,15 +35,11 @@ void Simulation::start() {
     for (const std::shared_ptr<Courier>& courier : fleet_.couriers()) {
         std::promise<void> promise;
         ready.push_back(promise.get_future());
-        // A member function on a thread. The shared_ptr is COPIED into the thread, so the courier
-        // lives at least as long as its thread; the promise is MOVED in (it is move-only).
         courierThreads_.emplace_back(&Courier::run, courier, std::move(promise));
     }
     {
         std::promise<void> promise;
         ready.push_back(promise.get_future());
-        // BY REFERENCE (std::ref): the dispatcher is a member of this object, and this object
-        // joins the thread in stop() before the dispatcher is destroyed.
         dispatcherThread_ = std::thread(&Dispatcher::run, std::ref(dispatcher_), std::move(promise));
     }
     {
@@ -53,25 +47,20 @@ void Simulation::start() {
         ready.push_back(promise.get_future());
         generatorThread_ = std::thread(&OrderGenerator::run, std::ref(generator_), std::move(promise));
     }
-    for (std::future<void>& f : ready) f.wait();   // every thread said "ready": no sleep as a barrier
+    for (std::future<void>& f : ready) f.wait();
 }
 void Simulation::stop() {
     if (stopped_) return;
     stopped_ = true;
-    // 1. No more orders.
     generator_.stop();
     if (generatorThread_.joinable()) generatorThread_.join();
-    // 2. Wake every thread from whatever it waits on: book, fleet, restaurants, its own clock.
     book_.close();
     fleet_.stop();
     for (const std::shared_ptr<Restaurant>& r : restaurants_) r->stop();
-    // 3. Join them all: none abandoned, none killed by the process exiting.
     if (dispatcherThread_.joinable()) dispatcherThread_.join();
     for (std::thread& t : courierThreads_)
         if (t.joinable()) t.join();
     pool_.shutdown();
-    // 4. Last line of the log. Orders still in the book or in a bag are pending:
-    //    the summary computes pending = created - delivered - rejected.
     if (started_) log_.simulationStopping();
 }
 bool Simulation::finished() const {

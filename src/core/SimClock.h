@@ -1,8 +1,6 @@
 #pragma once
 #include <chrono>
 
-// Simulated time: simulated ms = real ms * timeScale.
-// Every member is const, so any thread can read it without a lock.
 class SimClock {
 public:
     using Clock = std::chrono::steady_clock;

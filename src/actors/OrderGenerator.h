@@ -11,17 +11,14 @@
 #include "OrderBook.h"
 #include "Restaurant.h"
 #include "SimClock.h"
-// The order generator thread: creates orders at random moments, alone or in bursts, for the
-// whole run. Every random decision comes from ONE generator seeded with orders.seed, used only
-// by this thread, so a seed always gives the same sequence of orders.
 class OrderGenerator {
 public:
     OrderGenerator(const Config& cfg, const Graph& graph, const SimClock& clock, EventLog& log, OrderBook& book,
                    const std::vector<std::shared_ptr<Restaurant>>& restaurants);
-    void run(std::promise<void> ready);   // the body of the generator thread
-    void stop();                          // wakes it from its timed wait; it ends at once
+    void run(std::promise<void> ready);
+    void stop();
 private:
-    bool sleepUntil(long long simMs);     // false = stopping
+    bool sleepUntil(long long simMs);
     void createOrder();
     const Config& cfg_;
     const Graph& graph_;

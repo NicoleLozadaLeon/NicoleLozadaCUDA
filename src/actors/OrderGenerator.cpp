@@ -15,8 +15,6 @@ OrderGenerator::OrderGenerator(const Config& cfg, const Graph& graph, const SimC
       rng_(static_cast<std::uint64_t>(cfg.orders.seed)) {}
 void OrderGenerator::run(std::promise<void> ready) {
     ready.set_value();
-    // One arrival out of ten is a burst of 2..burstMax orders at the same instant. The gaps are
-    // stretched by the mean burst size, so the mean time between two orders is meanIntervalMs.
     const int burstMax = cfg_.orders.burstMax;
     const double meanBurst = burstMax >= 2 ? 0.9 + 0.1 * (2.0 + burstMax) / 2.0 : 1.0;
     const double meanGapMs = std::max(1, cfg_.orders.meanIntervalMs) * meanBurst;
@@ -45,7 +43,7 @@ void OrderGenerator::createOrder() {
         return;
     }
     Order order(id, static_cast<int>(r), delivery, createdAt, prepMs);
-    if (!book_.submit(std::move(order)))   // moved only if accepted
+    if (!book_.submit(std::move(order)))
         log_.orderRejected(id, "queueFull");
 }
 bool OrderGenerator::sleepUntil(long long simMs) {

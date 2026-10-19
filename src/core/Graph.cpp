@@ -12,7 +12,6 @@
 
 namespace {
 
-// Great-circle distance in meters between two lat/lon points.
 double haversine_m(double lat1, double lon1, double lat2, double lon2) {
     const double kEarthRadius = 6371000.0;
     const double kDegToRad = 3.14159265358979323846 / 180.0;
@@ -25,7 +24,7 @@ double haversine_m(double lat1, double lon1, double lat2, double lon2) {
     return 2 * kEarthRadius * std::asin(std::sqrt(a));
 }
 
-}  // namespace
+}
 
 Graph::Graph(const Config& cfg, int tasks, int grain) {
     const int n = static_cast<int>(cfg.nodes.size());
@@ -49,24 +48,20 @@ Graph::Graph(const Config& cfg, int tasks, int grain) {
         if (!st.oneWay)
             adj_[static_cast<std::size_t>(b)].push_back({a, meters, static_cast<int>(s)});
     }
-   // Sized ONCE, before any task starts: afterwards each task writes only its own rows,
-    // so no two tasks ever write the same element and no lock is needed.
     const std::size_t N = static_cast<std::size_t>(n);
     dist_.assign(N * N, kUnreachable);
     next_.assign(N * N, -1);
-    unsigned hw = std::thread::hardware_concurrency();   // a hint; 0 means "unknown"
+    unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 2;
     tasksUsed_ = std::max(1, std::min(tasks > 0 ? tasks : static_cast<int>(hw), n));
     grain_ = grain;
     const auto t0 = std::chrono::steady_clock::now();
-    std::atomic<int> nextSource{0};   // declared before `parts`: it must outlive every task
+    std::atomic<int> nextSource{0};
     std::vector<std::future<void>> parts;
     if (grain > 0) {
-        // Dynamic chunks: whoever is free claims the next `grain` sources.
         for (int t = 0; t < tasksUsed_; ++t)
             parts.push_back(std::async(std::launch::async, &Graph::claimSources, this, std::ref(nextSource), grain));
     } else {
-        // Static chunks: task t gets sources [t*chunk, (t+1)*chunk).
         const int chunk = (n + tasksUsed_ - 1) / tasksUsed_;
         for (int t = 0; t < tasksUsed_; ++t) {
             const int begin = t * chunk;
@@ -75,7 +70,7 @@ Graph::Graph(const Config& cfg, int tasks, int grain) {
             parts.push_back(std::async(std::launch::async, &Graph::sourceRange, this, begin, end));
         }
     }
-    for (std::future<void>& part : parts) part.get();   // fan-in; get() rethrows a task's exception
+    for (std::future<void>& part : parts) part.get();
     buildMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
 }
@@ -83,7 +78,7 @@ Graph::Graph(const Config& cfg, int tasks, int grain) {
 void Graph::claimSources(std::atomic<int>& next, int grain) {
     const int n = nodeCount();
     while (true) {
-        const int begin = next.fetch_add(grain);   // one atomic read-modify-write
+        const int begin = next.fetch_add(grain);
         if (begin >= n) return;
         const int end = std::min(n, begin + grain);
         for (int s = begin; s < end; ++s) shortestPathsFrom(s);
@@ -93,8 +88,6 @@ void Graph::sourceRange(int begin, int end) {
     for (int s = begin; s < end; ++s) shortestPathsFrom(s);
 }
 
-// Dijkstra from one source. Reads adj_ (never written after the constructor's first part)
-// and writes only row `source` of dist_ and next_.
 void Graph::shortestPathsFrom(int source) {
     const std::size_t N = ids_.size();
     const std::size_t row = static_cast<std::size_t>(source) * N;
@@ -109,7 +102,7 @@ void Graph::shortestPathsFrom(int source) {
         pq.pop();
         const double d = top.first;
         const int u = top.second;
-        if (d > dist_[row + static_cast<std::size_t>(u)]) continue;   // stale entry
+        if (d > dist_[row + static_cast<std::size_t>(u)]) continue;
         for (const Edge& e : adj_[static_cast<std::size_t>(u)]) {
             const double candidate = d + e.meters;
             if (candidate < dist_[row + static_cast<std::size_t>(e.to)]) {

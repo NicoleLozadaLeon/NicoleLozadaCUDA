@@ -10,25 +10,24 @@
 #include <opencv2/imgproc.hpp>
 namespace {
 const double kPi = 3.14159265358979323846;
-const int kFrameMs = 33;           // about 30 frames per second
-const double kMaxHeight = 900.0;   // the image is scaled down to fit a laptop screen
-// Web Mercator y of a latitude: OpenStreetMap images are in this projection.
+const int kFrameMs = 33;
+const double kMaxHeight = 900.0;
 double mercator(double latDeg) {
     return std::log(std::tan(kPi / 4.0 + latDeg * kPi / 360.0));
 }
-cv::Scalar colorOf(Courier::State state) {   // BGR
+cv::Scalar colorOf(Courier::State state) {
     switch (state) {
-        case Courier::State::ToRestaurant: return cv::Scalar(205, 110, 40);   // blue
-        case Courier::State::Carrying: return cv::Scalar(70, 160, 40);        // green
-        case Courier::State::Broken: return cv::Scalar(40, 40, 215);          // red
+        case Courier::State::ToRestaurant: return cv::Scalar(205, 110, 40);
+        case Courier::State::Carrying: return cv::Scalar(70, 160, 40);
+        case Courier::State::Broken: return cv::Scalar(40, 40, 215);
         case Courier::State::Idle: break;
     }
-    return cv::Scalar(130, 130, 130);                                         // grey
+    return cv::Scalar(130, 130, 130);
 }
 void text(cv::Mat& img, const std::string& s, cv::Point at, double size = 0.45) {
     cv::putText(img, s, at, cv::FONT_HERSHEY_SIMPLEX, size, cv::Scalar(20, 20, 20), 1, cv::LINE_AA);
 }
-}  // namespace
+}
 Window::Window(const Config& cfg) : cfg_(cfg) {
     const cv::Mat image = cv::imread(cfg.map.image, cv::IMREAD_COLOR);
     if (image.empty()) throw std::runtime_error("cannot read the map image: " + cfg.map.image);
@@ -36,7 +35,6 @@ Window::Window(const Config& cfg) : cfg_(cfg) {
     cv::resize(image, background_, cv::Size(), scale, scale, cv::INTER_AREA);
     mercNorth_ = mercator(cfg.map.bounds.north);
     mercSouth_ = mercator(cfg.map.bounds.south);
-    // Streets and restaurants never move: draw them once into the background.
     std::unordered_map<std::string, cv::Point> at;
     for (const NodeDef& n : cfg.nodes) at[n.id] = toPixel(n.lat, n.lon);
     for (const StreetDef& s : cfg.streets)
@@ -62,16 +60,13 @@ bool Window::frame(const Simulation& sim) {
     cv::Mat img = background_.clone();
     const Graph& graph = sim.graph();
     const long long now = sim.clock().nowMs();
-    // One snapshot per courier, one lock at a time.
     std::vector<Courier::View> views;
     for (const std::shared_ptr<Courier>& c : sim.fleet().couriers()) views.push_back(c->view());
-    // Delivery location of every active order: waiting in the book or inside a bag.
     for (int node : sim.book().deliveryNodes())
         cv::circle(img, nodePixel(graph, node), 5, cv::Scalar(20, 20, 20), 2, cv::LINE_AA);
     for (const Courier::View& v : views)
         for (const Courier::View::Item& item : v.bag)
             cv::circle(img, nodePixel(graph, item.deliveryNode), 5, cv::Scalar(20, 20, 20), 2, cv::LINE_AA);
-    // Couriers: the position moves smoothly along the current street segment.
     for (const Courier::View& v : views) {
         double f = 1.0;
         if (v.legFrom != v.legTo && v.legEndMs > v.legStartMs)
@@ -83,7 +78,6 @@ bool Window::frame(const Simulation& sim) {
         cv::circle(img, p, 8, colorOf(v.state), cv::FILLED, cv::LINE_AA);
         cv::circle(img, p, 8, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     }
-    // Live panel with the counters of the summary (a consistent snapshot under the log's lock).
     const EventLog::Summary s = sim.log().summary();
     cv::rectangle(img, cv::Rect(8, 8, 300, 128), cv::Scalar(250, 250, 250), cv::FILLED);
     cv::rectangle(img, cv::Rect(8, 8, 300, 128), cv::Scalar(60, 60, 60), 1);
@@ -106,12 +100,11 @@ bool Window::frame(const Simulation& sim) {
     }
     drawAttribution(img);
     cv::imshow(title_, img);
-    const int key = cv::waitKey(kFrameMs);   // shows the frame and paces the frame rate
+    const int key = cv::waitKey(kFrameMs);
     if (key == 'q' || key == 27) return false;
     return cv::getWindowProperty(title_, cv::WND_PROP_VISIBLE) >= 1;
 }
 void Window::drawAttribution(cv::Mat& img) const {
-    // The Hershey fonts of OpenCV are ASCII only, so a leading UTF-8 "©" is drawn by hand.
     std::string attribution = cfg_.map.attribution;
     const std::string copyright = "\xC2\xA9";
     const bool symbol = attribution.compare(0, copyright.size(), copyright) == 0;

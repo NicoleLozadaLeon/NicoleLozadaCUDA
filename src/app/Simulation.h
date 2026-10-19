@@ -15,19 +15,15 @@
 #include "Restaurant.h"
 #include "Settings.h"
 #include "SimClock.h"
-// Owns every shared object and every thread. The member order is deliberate: members are
-// built top to bottom and destroyed bottom to top, so everything a thread uses is built
-// before the thread starts and destroyed only after it has been joined.
 class Simulation {
 public:
     Simulation(const Config& cfg, const Settings& settings, const std::string& logPath);
-    ~Simulation();   // stop(): no thread is ever abandoned, even when an exception unwinds main
+    ~Simulation();
     Simulation(const Simulation&) = delete;
     Simulation& operator=(const Simulation&) = delete;
-    void start();           // starts every thread; returns once ALL of them are ready
-    void stop();            // orderly shutdown; safe to call more than once
-    bool finished() const;  // simulation.durationS reached
-    // Read-only access for the window and main.
+    void start();
+    void stop();
+    bool finished() const;
     const Graph& graph() const { return graph_; }
     const SimClock& clock() const { return clock_; }
     const EventLog& log() const { return log_; }
@@ -38,13 +34,13 @@ public:
     std::string graphReport() const;
 private:
     const Config& cfg_;
-    Graph graph_;           // read-only once built
-    SimClock clock_;        // starts after the graph is ready
-    EventLog log_;          // innermost lock of the program
+    Graph graph_;
+    SimClock clock_;
+    EventLog log_;
     OrderBook book_;
     std::vector<std::shared_ptr<Restaurant>> restaurants_;
     Fleet fleet_;
-    EstimatePool pool_;     // its workers start here and are joined in stop()
+    EstimatePool pool_;
     Dispatcher dispatcher_;
     OrderGenerator generator_;
     std::thread generatorThread_;
