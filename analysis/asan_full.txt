@@ -1,0 +1,9 @@
+QStandardPaths: wrong permissions on runtime directory /run/user/1000/, 0755 instead of 0700
+graph: 32 nodes, shortest paths in 39.0474 ms with 20 tasks (grain 4)
+dispatcher: mode=pool K=8 rankings=192 estimates=333 late=0 failed=0 avgRankUs=249 maxRankUs=2003
+-----------------------------------------------------
+Suppressions used:
+  count      bytes template
+      3        320 libfontconfig.so
+-----------------------------------------------------
+

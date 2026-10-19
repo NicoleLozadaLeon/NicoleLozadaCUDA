@@ -29,6 +29,8 @@ void text(cv::Mat& img, const std::string& s, cv::Point at, double size = 0.45) 
 }
 }
 Window::Window(const Config& cfg) : cfg_(cfg) {
+    cv::setNumThreads(0);
+
     const cv::Mat image = cv::imread(cfg.map.image, cv::IMREAD_COLOR);
     if (image.empty()) throw std::runtime_error("cannot read the map image: " + cfg.map.image);
     const double scale = std::min(1.0, kMaxHeight / image.rows);
