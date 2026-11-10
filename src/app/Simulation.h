@@ -9,6 +9,7 @@
 #include "EstimatePool.h"
 #include "EventLog.h"
 #include "Fleet.h"
+#include "KitchenScheduler.h"
 #include "Graph.h"
 #include "OrderBook.h"
 #include "OrderGenerator.h"
@@ -43,7 +44,9 @@ private:
     EstimatePool pool_;
     Dispatcher dispatcher_;
     OrderGenerator generator_;
+    KitchenScheduler kitchen_;
     std::thread generatorThread_;
+    std::thread kitchenThread_;
     std::thread dispatcherThread_;
     std::vector<std::thread> courierThreads_;
     bool started_ = false;
