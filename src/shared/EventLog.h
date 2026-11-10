@@ -14,6 +14,7 @@ public:
     struct Summary {
         long long created = 0, delivered = 0, rejected = 0, pending = 0;
         long long reassigned = 0, breakdowns = 0;
+        long long pauses = 0, pickupsDelayedByPause = 0;
         long long avgDeliveryMs = 0, maxDeliveryMs = 0;
         std::map<std::string, long long> deliveredPerCourier;
     };
@@ -30,6 +31,9 @@ public:
     void orderRejected(const std::string& order, const std::string& reason);
     void courierBreakdown(const std::string& courier);
     void orderReassigned(const std::string& order, const std::string& from, const std::string& to);
+    void restaurantPaused(const std::string& restaurant, long long t);
+    void restaurantResumed(const std::string& restaurant, long long t);
+    void pickupsDelayed(long long n);
     void simulationStopping();
 
     Summary summary() const;
@@ -38,6 +42,7 @@ public:
 private:
     using Fields = std::vector<std::pair<std::string, std::string>>;
     long long emit_(const std::string& event, const Fields& fields);
+    long long emitAt_(const std::string& event, const Fields& fields, long long t);
 
     mutable std::mutex mutex_;
     std::ofstream out_;

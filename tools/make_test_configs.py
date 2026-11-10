@@ -18,6 +18,8 @@ SCENARIOS = {
     "stress": {"simulation.timeScale": 600, "simulation.durationS": 3600, "orders.meanIntervalMs": 2000,
                "orders.burstMax": 30, "orders.maxPending": 20, "fleet.couriers": 16, "fleet.bagCapacity": 1,
                "restaurants.pickupSlots": 1, "incidents.breakdownProbability": 1.0},
+    "kitchen": {"simulation.timeScale": 300, "simulation.durationS": 3600, "restaurants.pickupSlots": 1,
+                "kitchen.pauseEveryMs": 900000, "kitchen.pauseMs": 240000},
     "idle": {"simulation.timeScale": 60, "simulation.durationS": 0, "orders.meanIntervalMs": 1000000000},
 }
 def main():
@@ -33,7 +35,7 @@ def main():
                 for r in cfg["restaurants"]:
                     r[key] = value
             else:
-                cfg[section][key] = value
+                cfg.setdefault(section, {})[key] = value
         out = f"config/scenarios/{name}.json"
         with open(out, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=1)

@@ -24,6 +24,12 @@ const json& require_object(const json& j, const char* key, const char* where) {
     return j.at(key);
 }
 
+long long require_integer(const json& j, const char* key, const std::string& where) {
+    if (!j.is_object() || !j.contains(key) || !j.at(key).is_number_integer())
+        throw ConfigError(where + ": missing or non-integer property '" + key + "'");
+    return j.at(key).get<long long>();
+}
+
 const json& require_array(const json& j, const char* key, const char* where) {
     if (!j.is_object() || !j.contains(key) || !j.at(key).is_array())
         throw ConfigError(std::string(where) + ": missing or invalid array '" + key + "'");
@@ -146,6 +152,17 @@ Config load_config(const std::string& path) {
         throw ConfigError("simulation.durationS must not be negative");
     if (cfg.simulation.timeScale <= 0)
         throw ConfigError("simulation.timeScale must be greater than 0");
+
+    if (root.contains("kitchen")) {
+        const json& k = require_object(root, "kitchen", "config");
+        cfg.kitchen.pauseEveryMs = require_integer(k, "pauseEveryMs", "kitchen");
+        cfg.kitchen.pauseMs = require_integer(k, "pauseMs", "kitchen");
+        if (cfg.kitchen.pauseEveryMs <= 0)
+            throw ConfigError("kitchen.pauseEveryMs must be greater than 0");
+        if (cfg.kitchen.pauseMs < 0 || cfg.kitchen.pauseMs >= cfg.kitchen.pauseEveryMs)
+            throw ConfigError("kitchen.pauseMs must be at least 0 and less than kitchen.pauseEveryMs");
+        cfg.kitchen.enabled = cfg.kitchen.pauseMs > 0;
+    }
 
     return cfg;
 }

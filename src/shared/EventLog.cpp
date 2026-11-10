@@ -10,8 +10,11 @@ EventLog::EventLog(const std::string& path, const SimClock& clock) : out_(path),
 }
 
 long long EventLog::emit_(const std::string& event, const Fields& fields) {
+    return emitAt_(event, fields, clock_.nowMs());
+}
+
+long long EventLog::emitAt_(const std::string& event, const Fields& fields, long long t) {
     nlohmann::ordered_json line;
-    const long long t = clock_.nowMs();
     line["t"] = t;
     line["event"] = event;
     for (const auto& f : fields) line[f.first] = f.second;
@@ -80,6 +83,22 @@ void EventLog::orderReassigned(const std::string& order, const std::string& from
     ++counters_.reassigned;
 }
 
+void EventLog::restaurantPaused(const std::string& restaurant, long long t) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emitAt_("restaurantPaused", {{"restaurant", restaurant}}, t);
+    ++counters_.pauses;
+}
+
+void EventLog::restaurantResumed(const std::string& restaurant, long long t) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    emitAt_("restaurantResumed", {{"restaurant", restaurant}}, t);
+}
+
+void EventLog::pickupsDelayed(long long n) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    counters_.pickupsDelayedByPause += n;
+}
+
 void EventLog::simulationStopping() {
     std::lock_guard<std::mutex> lock(mutex_);
     emit_("simulationStopping", {});
@@ -102,6 +121,8 @@ std::string EventLog::summaryJson() const {
     j["pending"] = s.pending;
     j["reassigned"] = s.reassigned;
     j["breakdowns"] = s.breakdowns;
+    j["pauses"] = s.pauses;
+    j["pickupsDelayedByPause"] = s.pickupsDelayedByPause;
     j["avgDeliveryMs"] = s.avgDeliveryMs;
     j["maxDeliveryMs"] = s.maxDeliveryMs;
     j["deliveredPerCourier"] = s.deliveredPerCourier;

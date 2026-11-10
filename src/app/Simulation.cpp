@@ -5,10 +5,10 @@
 #include <sstream>
 #include <utility>
 namespace {
-std::vector<std::shared_ptr<Restaurant>> makeRestaurants(const Config& cfg, const Graph& graph) {
+std::vector<std::shared_ptr<Restaurant>> makeRestaurants(const Config& cfg, const Graph& graph, EventLog& log) {
     std::vector<std::shared_ptr<Restaurant>> restaurants;
     for (const RestaurantDef& r : cfg.restaurants)
-        restaurants.push_back(std::make_shared<Restaurant>(r.id, r.name, graph.indexOf(r.node), r.pickupSlots));
+        restaurants.push_back(std::make_shared<Restaurant>(r.id, r.name, graph.indexOf(r.node), r.pickupSlots, log));
     return restaurants;
 }
 std::size_t poolSize(const Settings& settings) {
@@ -23,11 +23,12 @@ Simulation::Simulation(const Config& cfg, const Settings& settings, const std::s
       clock_(cfg.simulation.timeScale),
       log_(logPath, clock_),
       book_(static_cast<std::size_t>(cfg.orders.maxPending)),
-      restaurants_(makeRestaurants(cfg, graph_)),
+      restaurants_(makeRestaurants(cfg, graph_, log_)),
       fleet_(cfg, settings, graph_, clock_, log_, restaurants_),
       pool_(poolSize(settings)),
       dispatcher_(cfg, settings, graph_, clock_, log_, book_, fleet_, pool_, restaurants_),
-      generator_(cfg, graph_, clock_, log_, book_, restaurants_) {}
+      generator_(cfg, graph_, clock_, log_, book_, restaurants_),
+      kitchen_(cfg, clock_, log_, restaurants_) {}
 Simulation::~Simulation() { stop(); }
 void Simulation::start() {
     started_ = true;
@@ -47,13 +48,20 @@ void Simulation::start() {
         ready.push_back(promise.get_future());
         generatorThread_ = std::thread(&OrderGenerator::run, std::ref(generator_), std::move(promise));
     }
+    if (cfg_.kitchen.enabled) {
+        std::promise<void> promise;
+        ready.push_back(promise.get_future());
+        kitchenThread_ = std::thread(&KitchenScheduler::run, std::ref(kitchen_), std::move(promise));
+    }
     for (std::future<void>& f : ready) f.wait();
 }
 void Simulation::stop() {
     if (stopped_) return;
     stopped_ = true;
     generator_.stop();
+    kitchen_.stop();
     if (generatorThread_.joinable()) generatorThread_.join();
+    if (kitchenThread_.joinable()) kitchenThread_.join();
     book_.close();
     fleet_.stop();
     for (const std::shared_ptr<Restaurant>& r : restaurants_) r->stop();
