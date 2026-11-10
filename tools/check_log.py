@@ -17,6 +17,11 @@ def main():
         cfg = json.load(f)
     capacity = cfg["fleet"]["bagCapacity"]
     slots = {r["id"]: r["pickupSlots"] for r in cfg["restaurants"]}
+    kitchen = cfg.get("kitchen") or {}
+    every, length = kitchen.get("pauseEveryMs", 0), kitchen.get("pauseMs", 0)
+    index = {r["id"]: i for i, r in enumerate(cfg["restaurants"])}
+    paused = set()                          # restaurants whose kitchen window is closed right now
+    pause_count = defaultdict(int)          # restaurant -> pauses started so far
     errors = []
     state = {}                              # order -> created | assigned | pickedUp | delivered | rejected
     last_t = {}                             # order -> t of its last event
@@ -81,6 +86,8 @@ def main():
                 r = e.get("restaurant")
                 if state.get(o) != "assigned" or holder.get(o) != c:
                     err(n, f"pickupStarted for {o} by {c} in state {state.get(o)}")
+                if r in paused:
+                    err(n, f"pickupStarted at {r} while its kitchen is paused")
                 collecting[r][c] += 1
                 if len(collecting[r]) > slots.get(r, 0):
                     err(n, f"{len(collecting[r])} couriers collecting at {r} > {slots.get(r)} slots")
@@ -98,6 +105,29 @@ def main():
                 state[o] = "delivered"
                 bags[c].discard(o)
                 per_courier[c] += 1
+            elif ev == "restaurantPaused":
+                r = e.get("restaurant")
+                if r not in index:
+                    err(n, f"restaurantPaused for unknown restaurant {r}")
+                elif r in paused:
+                    err(n, f"{r} paused twice without a restaurantResumed")
+                elif not length:
+                    err(n, f"restaurantPaused at {r} but the configuration has no pauses")
+                else:
+                    start = pause_count[r] * every + index[r] * every // len(index)
+                    if t != start:
+                        err(n, f"{r} pause {pause_count[r]} starts at t={t}, the calendar says {start}")
+                paused.add(r)
+                pause_count[r] += 1
+            elif ev == "restaurantResumed":
+                r = e.get("restaurant")
+                if r not in paused:
+                    err(n, f"restaurantResumed for {r}, which is not paused")
+                else:
+                    start = (pause_count[r] - 1) * every + index[r] * every // len(index)
+                    if t != start + length:
+                        err(n, f"{r} pause {pause_count[r] - 1} ends at t={t}, the calendar says {start + length}")
+                paused.discard(r)
             elif ev == "simulationStopping":
                 stopping_line = n
             elif ev != "courierBreakdown":
@@ -113,10 +143,16 @@ def main():
         "pending": len(state) - delivered - rejected,
         "reassigned": count["orderReassigned"],
         "breakdowns": count["courierBreakdown"],
+        "pauses": count["restaurantPaused"],
     }
     for key, value in expected.items():
         if summary.get(key) != value:
             errors.append(f"summary {key} = {summary.get(key)}, log says {value}")
+    delayed = summary.get("pickupsDelayedByPause")
+    if not isinstance(delayed, int) or delayed < 0:
+        errors.append(f"summary pickupsDelayedByPause = {delayed}, must be a non-negative integer")
+    elif count["restaurantPaused"] == 0 and delayed != 0:
+        errors.append("summary: pickupsDelayedByPause is not 0 although there were no pauses")
     if summary["created"] != summary["delivered"] + summary["rejected"] + summary["pending"]:
         errors.append("summary: created != delivered + rejected + pending")
     if sum(summary["deliveredPerCourier"].values()) != summary["delivered"]:
@@ -131,6 +167,6 @@ def main():
         sys.exit(1)
     print(f"OK: {len(state)} orders, {delivered} delivered, {rejected} rejected, "
           f"{expected['pending']} pending, {expected['reassigned']} reassigned, "
-          f"{expected['breakdowns']} breakdowns")
+          f"{expected['breakdowns']} breakdowns, {expected['pauses']} pauses")
 if __name__ == "__main__":
     main()
