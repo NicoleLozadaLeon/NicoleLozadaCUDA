@@ -22,4 +22,8 @@ c = copy.deepcopy(good); c["fleet"]["couriers"] = 0; write("invalid_couriers", c
 c = copy.deepcopy(good); c["incidents"]["breakdownProbability"] = 1.5; write("invalid_probability", c)
 c = copy.deepcopy(good); c["fleet"]["startNode"] = "nope"; write("invalid_start_node", c)
 c = copy.deepcopy(good); c["nodes"].append(dict(c["nodes"][0])); write("invalid_duplicate_node", c)
+c = copy.deepcopy(good); c["kitchen"] = {"pauseEveryMs": 0, "pauseMs": 0}; write("invalid_kitchen_period", c)
+c = copy.deepcopy(good); c["kitchen"] = {"pauseEveryMs": 900000, "pauseMs": 900000}; write("invalid_kitchen_length", c)
+c = copy.deepcopy(good); c["kitchen"] = {"pauseEveryMs": 900000.5, "pauseMs": 1000}; write("invalid_kitchen_integer", c)
+c = copy.deepcopy(good); c["kitchen"] = {"pauseEveryMs": 900000}; write("invalid_kitchen_missing", c)
 print("written 10 invalid configs")

@@ -18,6 +18,7 @@ struct OrdersDef { int meanIntervalMs; int burstMax; int maxPending; long long s
 struct DispatchDef { int quoteTimeoutMs; int acceptTimeoutMs; };
 struct IncidentsDef { double breakdownProbability; };
 struct SimulationDef { int durationS; double timeScale; };
+struct KitchenDef { bool enabled = false; long long pauseEveryMs = 0; long long pauseMs = 0; };
 
 struct Config {
     MapInfo map;
@@ -29,6 +30,7 @@ struct Config {
     DispatchDef dispatch;
     IncidentsDef incidents;
     SimulationDef simulation;
+    KitchenDef kitchen;
 };
 
 Config load_config(const std::string& path);
