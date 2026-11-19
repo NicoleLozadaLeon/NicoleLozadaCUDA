@@ -243,3 +243,121 @@ done
 ncu --set full -k regex:"etaSoA|etaAoS" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps eta
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
+
+## 3.3 Aplicación 3: el mejor repartidor por pedido con argmin (08_reduction)
+
+### Tarea y por qué es data-parallel
+- Después del ETA (aplicación 2), cada pedido tiene una fila con el ETA de cada repartidor.
+- Hay que elegir, por fila, el repartidor con el menor ETA: un **argmin** por fila.
+- Es una **reducción**: muchos valores se combinan en uno con una operación asociativa (`min`).
+- Las filas son independientes entre sí, y dentro de una fila el `min` se puede hacer en árbol: es data-parallel.
+- Referencia en CPU: un bucle por fila que guarda el menor.
+
+### Dónde se usa en el programa
+- El Dispatcher, justo después del ETA.
+- Con `EQ_GPU=1`, `bestCourierGpu` encadena ETA y argmin **en la GPU**: la fila de ETA nunca vuelve a la CPU y solo vuelve el resultado, 8 bytes (commit de integración).
+
+### Diseño
+- **Clave empaquetada.** `key = (eta << 32) | id`, un entero de 64 bits. El `min` de la clave da el menor ETA y, si hay empate, el **id menor**. El resultado es determinista y sale igual en CPU y GPU.
+- **Block.** 256 threads (8 warps). **Grid.** Un bloque por fila (m bloques).
+- **Paso 1, coarsening.** Cada thread recorre varias columnas de su fila (j = t, t + 256, t + 512…) y guarda su mínimo en un registro. Con 5000 repartidores son unas 20 columnas por thread.
+- **Lecturas coalesced.** En cada vuelta, los 32 threads de un warp leen 32 ETA consecutivos.
+- **Paso 2, árbol en shared memory.** `partial[256]` (2 KB). Stride 128 → 64 → 32, con `__syncthreads()` después de cada paso.
+- **Stride decreciente.** Siempre trabajan los primeros threads (t < stride). Los warps que no trabajan quedan enteros sin trabajo: no se parte un warp por la mitad.
+- **Paso 3, warp shuffle.** Los últimos 32 valores los reduce el warp 0 con `__shfl_down_sync` (offset 16, 8, 4, 2, 1). Sin shared memory y sin barreras: los threads de un warp se pasan los valores por registros.
+- **Salida.** El thread 0 escribe la clave de la fila.
+- **CPU N threads.** `parallelFor` reparte las filas. Cada thread escribe solo sus filas.
+
+### Correctitud
+- Las claves son enteros: la GPU debe dar **exactamente** la misma clave que `cpuOne`. Sin tolerancia.
+- **Empates a propósito.** El bench usa ETA entre 0 y 2000 ms con hasta 5000 repartidores: por fuerza hay empates. Los ids van mezclados, así que gana el id menor y no la primera columna. La GPU coincide en todos.
+- El 2 % de los ETA es «inalcanzable» (`kNoEta`): nunca gana mientras haya otro.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- compute-sanitizer (`results/sanitizer_laptop_argmin.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Racecheck revisa justamente el árbol en shared memory.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms.
+Fuente: `results/bench_laptop_argmin.csv`, tabla de `analysis/report.ipynb`.
+
+| size (pedidos × repartidores) | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|
+| 10×50 | 0.001 | 0.001 (CPU 1) | 0.028 | 1.474 | 0.04 | 0.001 | yes |
+| 100×500 | 0.062 | 0.062 (CPU 1) | 0.013 | 1.653 | 4.7 | 0.04 | yes |
+| 500×2000 | 1.266 | 0.809 (N=2) | 0.024 | 2.995 | 34.3 | 0.27 | yes |
+| 1000×5000 | 6.809 | 2.143 (N=4) | 0.089 | 7.772 | 24.1 | 0.28 | yes |
+| 2000×5000 | 13.840 | 4.192 (N=4) | 0.170 | 11.484 | 24.6 | 0.37 | yes |
+
+- **Tamaño del problema** = elementos de la matriz de ETA: de 500 a 10⁷, más de cuatro órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 1.9 % (10×50), 0.8 %, 0.8 %, 1.1 %, 1.5 % (2000×5000). **Más del 98 % es subir la matriz y reservar memoria.** En 2000×5000 la matriz pesa 2000 × 5000 × 4 B = 40 MB.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (2000×5000, mediana).** 1 thread: 13.84 ms · 2: 7.37 · 4: 4.19 · 8: 4.24 · 14: 4.55 · 20: 4.59 ms.
+El mejor es **4 threads** (3.3×). Con más threads empeora: la CPU es memory-bound (cada valor se lee una vez y se hace una sola comparación) y con 4 threads ya satura el ancho de banda de la RAM.
+
+![thread sweep](../results/thread_sweep.png)
+
+### Profiler (Nsight Compute, `rowMin`, 500×2000, grid 500, block 256)
+| Métrica | Valor |
+|---|---|
+| Duration | 23.7 µs |
+| Theoretical / achieved occupancy | 100 % / ~100 % |
+| Block limit: warps / registers / shared mem | 6 / 10 / 10 bloques |
+| Registers per thread · shared por bloque | 18 · 2 KB |
+| Waves per SM | 2.8 |
+| Compute (SM) throughput | 22.1 % |
+| DRAM throughput | 72.0 % (203 GB/s) |
+| L1/TEX · L2 throughput | 21.2 % · 17.4 % |
+| L2 hit rate | 6.7 % |
+| Avg. active threads per warp | 31.7 de 32 |
+| Branch efficiency · divergent branches | 99.2 % · 4.2 |
+
+- **Occupancy.** 256 threads = 8 warps; caben 6 bloques por SM (48 warps): teórica 100 %. Limitan los warps; registros y shared memory dejarían 10.
+- **Memory-bound claro.** La DRAM trabaja al 72 % y el cómputo al 22 %. El L2 hit rate es 6.7 %: cada ETA se lee una sola vez, no hay reuso que aprovechar.
+- **Divergencia casi nula.** 31.7 de 32 threads activos y 99.2 % de branch efficiency. Lo poco que hay viene de la última vuelta del coarsening (2000 columnas no son múltiplo de 256) y del `if` que compara claves.
+- **Waves.** 2.8 waves con 500 filas. Con 10 filas solo hay 10 bloques: la GPU casi no se usa.
+
+### Roofline
+- Conteo por elemento: empaquetar la clave y comparar (unas 2 operaciones) y 4 bytes leídos de la matriz.
+- Intensidad aritmética: **0.5 op/byte**. Rendimiento alcanzado en 2000×5000: **1.17 × 10¹¹ op/s**.
+- Ridge point ≈ 48 op/byte. Con 0.5 el kernel queda muy a la izquierda: **memory-bound**.
+- El techo de memoria en 0.5 op/byte es 0.5 × 336 GB/s = 1.68 × 10¹¹ op/s. El kernel llega al **70 %** de ese techo.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** La GPU tiene 46 080 threads residentes (30 SMs × 1536). Con 10×50 hay 10 bloques × 256 = 2560 threads, y cada fila tiene solo 50 columnas: 206 de los 256 threads de cada bloque no tienen datos. Desde 500×2000 la GPU se llena (2.8 waves y más).
+- **Overheads.** El kernel es menos del 2 % del end to end. Subir la matriz de ETA y reservar memoria cuesta entre 50 y 120 veces más que reducirla.
+- **¿Los datos pueden quedarse en la GPU?** Sí, y es la clave de esta aplicación. En el programa la matriz de ETA la genera la aplicación 2 **en la GPU** y la reduce `rowMin` ahí mismo (`bestCourierGpu`). No se sube ninguna matriz y vuelve 1 clave de 8 bytes. El bench mide el peor caso: la matriz viene de la CPU.
+- **Memory-bound.** Una lectura y una comparación por elemento. El techo es el ancho de banda, en la GPU y en la CPU.
+- **Optimización antes/después.** No se midió una versión sin coarsening ni sin warp shuffle. El diseño ya usa las dos técnicas de la sesión 18.
+- **Contención y sincronización.** No hay atomics: un bloque por fila, así que no hay que combinar resultados entre bloques. Dentro del bloque, 4 barreras (`__syncthreads()`): una antes del árbol y una por cada paso (128, 64, 32). Ninguna en el warp shuffle.
+- **Correctitud en paralelo.** El orden de las comparaciones cambia entre CPU y GPU, pero el `min` de enteros no depende del orden. La clave `(eta, id)` resuelve los empates igual en los dos lados. Determinista.
+
+### Veredicto
+- **Crossover end to end: nunca.** Con la matriz subiendo desde la CPU, la GPU no le gana a la mejor CPU en ningún tamaño (máximo 0.37×).
+- **El kernel solo gana desde 100×500: 4.7–34×.** El problema son las copias, no el cálculo.
+- **Escala del brief (8 repartidores, un pedido por ranking):** 8 valores. **CPU.**
+- **Ciudad (un pedido contra 400 o 2000 repartidores):** una fila, un solo bloque. La GPU casi no trabaja. Por separado, **CPU**.
+- **Decisión: usar la GPU solo encadenada con el ETA** (aplicaciones 2 + 3 juntas), para que la matriz no cruce entre CPU y GPU. Por sí sola, sin la matriz ya en la GPU, no conviene. El efecto del encadenado en el programa se mide en la sección 5 (latencia de despacho, `avg_rank_us`).
+
+### Threats to validity
+- **Kernels muy cortos.** En 10×50 y 100×500 el kernel dura 13–28 µs, con mucha dispersión (de 6 a 96 µs en 10×50).
+- **Dispersión del end to end.** En 2000×5000: GPU de 9.2 a 15.3 ms; CPU con 20 threads de 3.8 a 5.2 ms. La conclusión no cambia: la CPU gana en todo el rango.
+- **El bench es el peor caso para la GPU** (sube la matriz entera). En el programa no se sube; por eso el veredicto separa las dos situaciones.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_argmin.csv --machine laptop --threads 1,2,4,8,14,20 --apps argmin
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps argmin
+done
+ncu --set full -k regex:"rowMin" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps argmin
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
