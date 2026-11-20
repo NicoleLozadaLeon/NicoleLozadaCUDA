@@ -603,3 +603,120 @@ done
 ncu --set full -k regex:"countChunks|scatterChunks" -c 4 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps group
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
+
+## 3.6 Aplicación 6: mapa de calor de demanda con una convolución gaussiana (05_conv)
+
+### Tarea y por qué es data-parallel
+- El mapa de Equipetrol se divide en una grilla de celdas. Cada celda cuenta las entregas recientes y los pedidos pendientes que caen en ella.
+- Ese conteo es «ruidoso» (muchas celdas en 0). Se suaviza con un **filtro gaussiano 5×5** (radio 2): cada celda pasa a ser el promedio ponderado de sus 25 vecinas.
+- Es una **convolución**: cada celda de salida se calcula sola, leyendo solo la entrada. No hay dependencias entre celdas: es data-parallel.
+- Referencia en CPU: `cpuOne`, cuatro bucles (celda y, celda x, filtro y, filtro x).
+
+### Dónde se usa en el programa
+- La ventana: el overlay `demand heatmap`, que se recalcula cada 30 frames.
+- Lo pide la ventana a través de `Accel::smooth`. Con `EQ_GPU=1` lo ejecuta el único hilo dueño de la GPU (commit de integración). La ventana no se bloquea: recibe un `std::future` y lo dibuja cuando está listo.
+
+### Diseño
+- **Un thread por celda de salida.** Block 16×16 (256 threads, 8 warps). Grid 2D que cubre la grilla.
+- **Filtro en `__constant__` memory.** Los 25 coeficientes (hasta 169 con radio 6) van a la memoria constante. En cada paso del bucle los 32 threads de un warp leen el **mismo** coeficiente: la constant cache lo reparte de una vez (broadcast).
+- **Radio como parámetro de plantilla** (`convolve<R>`). El compilador conoce el tamaño del filtro y desenrolla los dos bucles (`#pragma unroll`): 25 multiplicaciones y sumas sin control de bucle.
+- **Bordes.** Las vecinas que caen fuera del mapa se saltan (`continue`). Solo afecta a los threads del borde.
+- **Lecturas coalesced.** Los threads vecinos en x leen celdas vecinas en memoria. Las 25 lecturas de una celda se solapan con las de sus vecinas: las sirve la caché L1.
+- **Sin tiling en shared memory.** Para un filtro 5×5 la L1 ya da el reuso (hit rate 92 %, ver Profiler).
+- **CPU N threads.** `parallelFor` reparte las filas de la grilla. Cada thread escribe solo sus filas.
+
+### Correctitud
+- Son números `float`. La GPU usa **FMA** (multiplicar y sumar en una sola instrucción, con un solo redondeo) y la CPU no siempre. Los resultados difieren en los últimos bits.
+- Tolerancia: error relativo al máximo de la grilla **≤ 10⁻⁵** (`maxRelativeError`). El orden de la suma es el mismo en CPU y GPU (mismos bucles).
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- compute-sanitizer (`results/sanitizer_laptop_conv.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Memcheck revisa justamente los accesos en los bordes.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms.
+Fuente: `results/bench_laptop_conv.csv`, tabla de `analysis/report.ipynb`.
+Entradas: el mapa de Equipetrol con celdas de 20 m a 1 m. Puntos sintéticos con semilla fija (una celda de cada 50 tiene un punto).
+
+| size (celda, grilla) | celdas | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|---|
+| 20 m, 95×136 | 1.3 × 10⁴ | 0.260 | 0.260 (CPU 1) | 0.015 | 0.691 | 17 | 0.38 | yes |
+| 10 m, 190×271 | 5.1 × 10⁴ | 1.030 | 0.465 (N=4) | 0.016 | 0.770 | 28 | 0.60 | yes |
+| 5 m, 380×542 | 2.1 × 10⁵ | 4.270 | 1.402 (N=4) | 0.015 | 1.397 | 91 | 1.00 | yes |
+| 2 m, 949×1354 | 1.3 × 10⁶ | 25.806 | 4.978 (N=20) | 0.079 | 3.537 | 63 | 1.41 | yes |
+| 1 m, 1898×2707 | 5.1 × 10⁶ | 102.811 | 15.884 (N=20) | 0.269 | 7.793 | 59 | 2.04 | yes |
+
+- **Tamaño del problema** = celdas: de 1.3 × 10⁴ a 5.1 × 10⁶, más de dos órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 2.2 % (20 m), 2.1 %, 1.1 %, 2.2 %, 3.5 % (1 m). **Más del 96 % es copiar y reservar memoria.** Con 1 m se suben 5.1 × 10⁶ × 4 B = 20.5 MB y se bajan otros 20.5 MB.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (1 m, mediana).** 1 thread: 102.8 ms · 2: 53.5 · 4: 27.8 · 8: 21.3 · 14: 16.7 · 20: 15.9 ms.
+Speedup de **6.5×** con 20 threads. Casi lineal hasta 4 (cores P); después crece menos, porque los cores E son más lentos. A diferencia de las aplicaciones anteriores, la CPU escala: hay 25 operaciones por celda leída, no 1.
+
+![thread sweep](../results/thread_sweep.png)
+
+### Profiler (Nsight Compute, `convolve<2>`, 5 m 380×542, grid 24×34, block 16×16)
+| Métrica | Valor |
+|---|---|
+| Duration | 13.4 µs |
+| Theoretical / achieved occupancy | 100 % / 77.6 % |
+| Block limit: warps / registers / shared mem | 6 / 10 / 8 bloques |
+| Registers per thread · shared por bloque | 17 · 0 B |
+| Waves per SM | 4.53 |
+| Compute (SM) throughput | 66.2 % |
+| Memory throughput | 68.9 % |
+| DRAM throughput | 27.9 % |
+| L1/TEX · L2 throughput | 76.7 % · 19.7 % |
+| L1/TEX · L2 hit rate | 91.8 % · 69.1 % |
+| Avg. active threads per warp | 31.7 de 32 |
+| Branch efficiency · divergent branches | 99.85 % · 0.40 |
+
+- **Occupancy.** 256 threads = 8 warps; caben 6 bloques por SM: teórica 100 %. Limitan los warps. La alcanzada es 78 %.
+- **El reuso lo da la L1.** Hit rate de 92 %: de cada 25 lecturas de una celda, casi todas ya están en L1 porque las leyó un thread vecino. Por eso la DRAM trabaja solo al 28 %.
+- **Balanceado.** Cómputo al 66 % y memoria (sobre todo L1) al 69 %. No está saturado ni en DRAM ni en cómputo: está cerca de la mitad del roofline.
+- **Divergencia casi nula.** 31.7 de 32 threads activos y 99.85 % de branch efficiency. Viene de los bordes: el `continue` en las vecinas de afuera y la última columna de bloques (380 no es múltiplo de 16: 24 bloques, el último a medias).
+
+### Roofline
+- Conteo por celda: 25 multiplicaciones y 25 sumas (**50 operaciones**). Bytes: se lee la celda 1 vez de DRAM (las otras 24 lecturas las da la caché) y se escribe 1 vez (**8 bytes**).
+- Intensidad aritmética: **6.25 op/byte**. Rendimiento alcanzado con 1 m: **9.54 × 10¹¹ op/s**, el más alto de las 7 aplicaciones.
+- Ridge point ≈ 48 op/byte. Con 6.25 queda a la izquierda: el techo es la memoria, 6.25 × 336 GB/s = 2.10 × 10¹² op/s.
+- El kernel llega al **45 %** de ese techo.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** La GPU tiene 46 080 threads residentes. Con 20 m hay 12 920 celdas: la GPU no se llena. Desde 5 m (816 bloques, 4.5 waves) sí.
+- **Overheads.** El kernel es menos del 4 % del end to end. La copia de ida y vuelta es lo que se paga.
+- **Por qué aquí la GPU sí gana.** Es la aplicación con más trabajo por byte copiado: 50 operaciones por cada 8 bytes. En la CPU con 1 m son 103 ms con 1 thread y 16 ms con 20; la GPU hace el cálculo en 0.27 ms y le alcanza aunque copie 41 MB.
+- **¿Los datos pueden quedarse en la GPU?** En el programa, no: la grilla de demanda la arma la ventana en la CPU cada 30 frames. Hay que subirla y bajarla.
+- **Optimización antes/después.** No se midió una versión con tiling en shared memory. Con hit rate de L1 del 92 % el margen es chico; sería la siguiente prueba si se usara un filtro más grande.
+- **Contención y sincronización.** Ninguna: cada thread escribe una sola celda y la entrada solo se lee. No hay atomics ni `__syncthreads()`.
+- **Correctitud en paralelo.** Ningún thread depende de otro. La única diferencia con la CPU es el redondeo de FMA, dentro de la tolerancia.
+
+### Veredicto
+- **Crossover end to end: unas 2 × 10⁵ celdas (5 m).** Ahí la GPU empata (1.00×). Con 2 m gana 1.41× y con 1 m **2.04×**.
+- **El kernel gana desde la grilla más chica: 17–91×.**
+- **Escala del brief:** una grilla gruesa, pocas celdas. **CPU.**
+- **Ciudad (la ventana usa celdas de 25 m: 76 × 109 ≈ 8 300 celdas):** está por debajo de la grilla más chica medida. La CPU con 1 thread tarda unos 0.2 ms. **CPU.**
+- **Decisión: CPU en el programa tal como está.** La GPU convendría con un mapa de calor de 2 m o más fino (más de 10⁶ celdas), o con un filtro más grande.
+
+### Threats to validity
+- **Kernels muy cortos.** Con 20 m a 5 m el kernel dura unos 15 µs, igual en los tres tamaños: es el costo mínimo del launch, no el cálculo. Con 20 m va de 9 a 62 µs.
+- **Dispersión de la CPU multithread.** Con 1 m y 20 threads: de 14.6 a 22.8 ms. El end to end de la GPU: de 7.5 a 12.0 ms. Por eso se reporta la mediana; con la mediana la GPU gana en todos los casos de 1 m.
+- **Entrada sintética.** Puntos al azar. El tiempo no depende de los valores (siempre son 25 operaciones por celda), así que la entrada real daría lo mismo.
+- **ncu con 5 m.** Con 1 m la occupancy y el uso de DRAM pueden cambiar; no se perfiló ese tamaño.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_conv.csv --machine laptop --threads 1,2,4,8,14,20 --apps conv
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps conv
+done
+ncu --set full -k regex:"convolve" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps conv
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
