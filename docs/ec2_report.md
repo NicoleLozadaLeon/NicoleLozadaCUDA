@@ -853,3 +853,151 @@ ncu --set full -k regex:"sweep" -c 2 --csv --page details ./build-gpu/delivery_s
 ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/all.csv --reps 1 --size 0   # las 7 aplicaciones juntas
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
+
+## 3.8 Aplicación 8 (2ª de 03_memory_tiling): repartidores cerca de cada esquina, con tiles en shared memory
+
+### Tarea y por qué es data-parallel
+- Para cada esquina del mapa se cuenta **cuántos repartidores están a menos de 500 m**. Sirve para encontrar las esquinas sin repartidores cerca.
+- Cada esquina se calcula sola: es data-parallel. En la ciudad (`city_60`) son 3600 esquinas × 2000 repartidores = **7.2 millones de comparaciones**.
+- **Por qué es tiling (patrón de la sesión 13).** Es como el producto de matrices: todas las esquinas necesitan **los mismos** repartidores. Sin tiles, cada thread lee los 2000 repartidores de la memoria global. Con tiles, el bloque los carga una vez en shared memory y todos sus threads los reusan.
+- Posiciones en **metros enteros** y la comparación `dx² + dy² ≤ 500²`: el resultado es un conteo exacto.
+- Referencia en CPU: `cpuOne`, cada esquina contra cada repartidor.
+
+### Dónde se usa en el programa
+- El resumen final: las esquinas sin repartidores cerca. Las esquinas son los nodos del grafo y nunca cambian; las posiciones de los repartidores cambian en cada consulta.
+- Con `EQ_GPU=1` se calcula a través del único hilo dueño de la GPU (commit de integración).
+
+### Diseño
+- **Un thread por esquina.** Block de **128 threads**: con 3600 esquinas son 29 bloques, casi uno por SM (la GPU tiene 30).
+- **Tiles de repartidores (`countTiled`).** El bloque recorre los repartidores de a 128:
+  1. cada thread copia **un** repartidor a shared memory (`tileX`, `tileY`, 1 KB);
+  2. `__syncthreads()`;
+  3. cada thread compara su esquina con los 128 del tile;
+  4. `__syncthreads()` antes de cargar el siguiente tile.
+- **Reuso.** Cada repartidor se lee de la memoria global **una vez por bloque**, no una vez por thread: 128 veces menos lecturas.
+- **Bordes (como `04_tiled_matmul_boundary.cu`).** 3600 no es múltiplo de 128: los threads que sobran en el último bloque igual cargan su repartidor y llegan a las dos barreras, pero no guardan resultado.
+- **Lectura sin bank conflicts.** En cada paso, los 32 threads de un warp leen el **mismo** `tileX[k]`: es un broadcast.
+- **Datos que se quedan en la GPU.** Las esquinas no cambian, así que se suben **una vez** (`DeviceCorners`, como la tabla del ETA en la aplicación 2). En cada consulta solo se suben los repartidores: 2000 × 8 B = 16 KB. Se baja un conteo por esquina (14 KB).
+- **Versiones para comparar.** `gpu_naive`: el mismo cálculo sin tiles. `gpu_upload`: con tiles, pero sube esquinas y repartidores en cada llamada.
+- **CPU N threads (la mejor CPU).** No compara contra todos: reparte los repartidores en una **grilla de celdas de 500 m**, y cada esquina solo mira las 3 × 3 celdas de alrededor (un repartidor a menos de 500 m está como mucho a una celda). `parallelFor` reparte las esquinas; cada thread escribe solo las suyas.
+
+### Correctitud
+- Son conteos enteros: la GPU (las 3 versiones) y la CPU con grilla deben dar **exactamente** lo mismo que `cpuOne`. Sin tolerancia.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- No hay atomics: cada thread escribe solo el conteo de su esquina. Determinista.
+- compute-sanitizer (`results/sanitizer_laptop_near.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Racecheck revisa el tile en shared memory y sus dos barreras.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms.
+Fuente: `results/bench_laptop_near.csv`, tabla de `analysis/report.ipynb`.
+Entradas: esquinas y repartidores al azar sobre el mapa de Equipetrol (1898 × 2707 m), semilla fija. Radio 500 m.
+
+| size (esquinas × repartidores) | pares | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|---|
+| 100 × 50 | 5 × 10³ | 0.007 | 0.007 (CPU 1) | 0.013 | 0.263 | 0.5 | 0.03 | yes |
+| 400 × 200 | 8 × 10⁴ | 0.092 | 0.092 (CPU 1) | 0.011 | 0.208 | 8.2 | 0.44 | yes |
+| 1600 × 1000 | 1.6 × 10⁶ | 1.781 | 0.361 (N=4) | 0.020 | 0.314 | 17.6 | 1.15 | yes |
+| **3600 × 2000 (ciudad)** | 7.2 × 10⁶ | 8.195 | 0.771 (N=4) | 0.030 | 0.311 | 25.9 | **2.48** | yes |
+| 10000 × 5000 | 5 × 10⁷ | 55.701 | 4.599 (N=14) | 0.116 | 0.903 | 39.7 | 5.09 | yes |
+
+- **Tamaño del problema** = pares esquina × repartidor: de 5 × 10³ a 5 × 10⁷, cuatro órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+- **«mejor CPU» con N ≥ 1 usa la grilla.** La grilla sola, con 1 thread, ya es 4.3× (ciudad) a 4.9× (10000 × 5000) más rápida que `cpuOne`.
+
+**Repetición del bench completo (speedup e2e contra la mejor CPU).** El end to end de la GPU varía entre corridas, así que corrí el bench completo 3 veces (`results/probe_laptop_near_run2.csv` y `run3.csv`):
+
+| pares | corrida oficial | corrida 2 | corrida 3 |
+|---|---|---|---|
+| 1.6 × 10⁶ | 1.15 | 0.72 | 0.78 |
+| **7.2 × 10⁶ (ciudad)** | **2.48** | **1.28** | **1.21** |
+| 5 × 10⁷ | 5.09 | 3.98 | 3.45 |
+
+La corrida oficial es la más favorable. **En las 3, la GPU gana a la escala de la ciudad.**
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 4.8 % (100 × 50), 5.4 %, 6.5 %, 9.6 % (ciudad), 12.8 % (10000 × 5000). Aun con solo 16 KB de subida, **casi todo el end to end es el costo fijo de reservar, copiar y lanzar**: entre 0.2 y 0.3 ms.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (10000 × 5000, mediana).** `cpuOne` (1 thread, sin grilla): 55.7 ms. Con grilla: 1 thread 11.45 ms · 2: 6.14 · 4: 5.85 · 8: 4.80 · 14: 4.60 · 20: 4.63 ms.
+Con grilla, 20 threads son 2.5× más rápidos que 1. Se estanca desde 8 threads. Con la ciudad, el mejor es 4 threads (0.77 ms); con 20 threads tarda 1.63 ms, porque crear los threads cuesta más que el trabajo.
+
+![thread sweep](../results/thread_sweep.png)
+
+### Optimización antes/después: con tiles y sin tiles
+Kernel solo, mediana en ms (mismo CSV):
+
+| pares | sin tiles (`gpu_naive`) | con tiles (`gpu`) | mejora |
+|---|---|---|---|
+| 1.6 × 10⁶ | 0.039 | 0.020 | 2.0× |
+| 7.2 × 10⁶ (ciudad) | 0.069 | 0.030 | 2.3× |
+| 5 × 10⁷ | 0.195 | 0.116 | 1.7× |
+
+En Nsight Compute (ciudad): **30.0 µs con tiles contra 106.6 µs sin tiles (3.5×)**.
+- Sin tiles, la caché L1 ya da parte del reuso (hit rate 96.5 %), pero cada thread igual hace su propia lectura de los 2000 repartidores.
+- Con tiles, cada repartidor se lee de global una vez por bloque y después todo sale de shared memory por broadcast. Además usa menos registros (31 contra 40).
+- Con 100 × 50 y 400 × 200 no hay diferencia: hay un solo tile y el kernel dura unos 12 µs, que es casi el costo del launch.
+
+### Profiler (Nsight Compute, `countTiled`, 3600 × 2000, grid 29, block 128)
+| Métrica | `countTiled` (con tiles) | `countNaive` (sin tiles) |
+|---|---|---|
+| Duration | 30.0 µs | 106.6 µs |
+| Theoretical / achieved occupancy | 100 % / 8.3 % | 100 % / 8.1 % |
+| Block limit: warps / registers / shared mem | 12 / 16 / 16 bloques | 12 / 12 / 16 bloques |
+| Registers per thread · shared por bloque | 31 · 1 KB | 40 · 0 B |
+| Waves per SM | 0.08 | 0.08 |
+| Compute (SM) throughput | 37.6 % | 19.9 % |
+| DRAM throughput | 0.7 % | 0.2 % |
+| L1/TEX · L2 throughput | 21.1 % · 1.8 % | 20.9 % · 0.8 % |
+| L1/TEX · L2 hit rate | 0 % · 90.4 % | 96.5 % · 87.8 % |
+| Avg. active threads per warp | 32 de 32 | 31.9 de 32 |
+| Branch efficiency · divergent branches | 100 % · 0 | 100 % · 0 |
+
+- **El límite es el paralelismo, no la memoria.** Hay solo 3600 threads (29 bloques × 4 warps = 116 warps) en una GPU que admite 1440 warps residentes. Por eso la occupancy alcanzada es 8 % aunque la teórica sea 100 %, y hay 0.08 waves.
+- **La DRAM casi no trabaja (0.7 %).** Los datos son 45 KB y viven en L2 (hit rate 90 %). Con tiles, las lecturas globales son tan pocas que L1 no tiene nada que reusar (hit rate 0 %): el reuso pasa a shared memory.
+- **Con tiles el cómputo sube de 20 % a 38 %**: los warps pasan más tiempo comparando y menos esperando lecturas.
+- **Sin divergencia.** 32 de 32 threads activos y 100 % de branch efficiency: el `? 1 : 0` no aparece como rama divergente (probablemente el compilador lo resuelve sin salto), y todos los threads de un warp recorren el mismo tile.
+
+### Roofline
+- Conteo por par: 2 restas, 2 multiplicaciones, 1 suma, 1 comparación y 1 suma al contador (**7 operaciones enteras**).
+- Bytes de memoria global: con tiles, cada repartidor (8 B) se lee una vez por bloque de 128 esquinas: 8 / 128 = 1/16 B por par. Las esquinas y la salida son despreciables.
+- Intensidad aritmética: 7 × 16 = **112 op/byte**. **Es la única de las 8 aplicaciones a la derecha del ridge point (≈ 48): compute-bound en el roofline.** Sin tiles serían 8 B por par: 0.9 op/byte, muy memory-bound. **Los tiles mueven el kernel de un lado al otro del roofline.**
+- Rendimiento alcanzado con 10000 × 5000: **3.03 × 10¹² op/s**, el más alto de las 8 aplicaciones. Es el 19 % del pico de cómputo (16.1 × 10¹², que es de float; el de enteros es más bajo).
+- No llega al techo por la occupancy baja: pocas esquinas = pocos threads.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** Es el límite de esta aplicación. Con 100 esquinas hay 1 bloque; con la ciudad, 29 bloques para 30 SMs, y cada uno con solo 4 warps. Una mejora posible: repartir también los repartidores entre bloques (grid 2D) para tener más threads, sumando los conteos parciales con `atomicAdd`. No se midió.
+- **Overheads.** El kernel es menos del 13 % del end to end. El costo fijo (reservar, copiar 16 KB, lanzar, bajar 14 KB) es de 0.2–0.3 ms. Por eso la GPU necesita al menos ~1.6 × 10⁶ pares para empatar.
+- **¿Los datos pueden quedarse en la GPU?** Las esquinas sí (`DeviceCorners`): se suben una vez. Pero a este tamaño casi no se nota: con 3600 × 2000, `gpu_upload` (que sube todo, 45 KB) y `gpu` (que sube 16 KB) tardan lo mismo dentro del ruido. Lo que pesa es el costo fijo de cada llamada, no la cantidad de bytes.
+- **La CPU con grilla es un rival fuerte.** Cada esquina solo mira 3 × 3 celdas de 500 m (unos 2.25 km² de los 5.1 km² del mapa): se salta más de la mitad de las comparaciones, y en la práctica es 4.3–4.9× más rápida que `cpuOne`. Aun así, la GPU hace **todas** las comparaciones y gana, porque 7.2 millones de comparaciones con tiles le toman 30 µs.
+- **Contención y sincronización.** Sin atomics: cada thread es dueño de su esquina. Dos `__syncthreads()` por tile: uno para no leer el tile antes de que esté cargado y otro para no pisarlo mientras alguien lo lee.
+- **Correctitud en paralelo.** Enteros: el orden de las comparaciones no cambia el conteo.
+
+### Veredicto
+- **Crossover end to end: entre 1.6 × 10⁶ y 7.2 × 10⁶ pares.** Con 1600 × 1000 empata o pierde según la corrida (0.72–1.15×).
+- **Ciudad (`city_60`, 3600 esquinas × 2000 repartidores): la GPU gana en las 3 corridas, 1.2× a 2.5×. Usar la GPU.**
+- **Escala del brief (25 esquinas, unos pocos repartidores):** microsegundos en la CPU con 1 thread. **CPU.**
+- **Decisión: GPU desde unos 2 × 10⁶ pares** (la ciudad), CPU por debajo. Con 10000 × 5000 gana de 3.5× a 5.1×.
+
+### Threats to validity
+- **El end to end de la GPU varía entre corridas.** En la ciudad: 0.31 ms en la oficial y 0.65–0.67 ms en las otras dos. Por eso se muestran las 3 corridas. En pruebas anteriores, con una versión previa del código (que subía todo en 4 copias), el end to end llegó a ~1 ms y la CPU ganaba en la ciudad.
+- **El orden de las versiones influye.** La primera versión de GPU después de las de CPU paga unos 0.15–0.2 ms extra. Lo comprobé invirtiendo el orden (`results/probe_laptop_near_order.csv`): con el orden invertido, `gpu` bajó de 0.311 a 0.189 ms y `gpu_upload` subió de 0.153 a 0.362 ms. El kernel no cambia. En la tabla, `gpu` va primera: es el número **pesimista** para la GPU.
+- **Posiciones al azar.** En la ciudad real los repartidores se juntan cerca de los restaurantes. Eso ayuda o perjudica a la grilla de la CPU (celdas más llenas), pero no a la GPU, que compara todo.
+- **Radio fijo de 500 m.** Con un radio más chico la grilla de la CPU descarta más y puede ganar; con uno más grande, menos.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_near.csv --machine laptop --threads 1,2,4,8,14,20 --apps near
+./build-gpu/delivery_sim config/equipetrol.json --bench results/probe_laptop_near_run2.csv --machine laptop --threads 1,2,4,8,14,20 --apps near   # y run3
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps near
+done
+ncu --set full -k regex:"countTiled|countNaive" -c 4 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 3 --reps 1 --threads 2 --apps near
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
+La prueba del orden (`probe_laptop_near_order.csv`) se hizo invirtiendo temporalmente el orden de los tres `addGpu` en `BenchNearby.cpp` y corriendo `--size 3 --threads 4`.

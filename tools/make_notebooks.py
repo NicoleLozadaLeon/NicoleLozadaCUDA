@@ -94,6 +94,7 @@ REPORT = [
              "    if app == 'group': return 2 * 64 * n, 12 * n\n"
              "    if app == 'conv': return 2 * 25 * n, 8 * n\n"
              "    if app == 'stencil': return 100 * 6 * n, 100 * 12 * n\n"
+             "    if app == 'near': return 7 * n, 8 * n / 128\n"
              "    return np.nan, np.nan\n"
              "pts = []\n"
              "for app in APPS:\n"
