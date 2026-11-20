@@ -361,3 +361,122 @@ done
 ncu --set full -k regex:"rowMin" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps argmin
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
+
+## 3.4 Aplicación 4: histograma de tiempos de entrega con bins privatizados (07_histogram)
+
+### Tarea y por qué es data-parallel
+- Al final de la simulación se cuenta cuántas entregas tardaron 0–1 min, 1–2 min, … hasta 119 min.
+- Son 120 bins de 1 minuto. El último junta todo lo que pasa de 119 min.
+- Cada entrega se clasifica sola (su bin = tiempo ÷ 60 000 ms): es data-parallel.
+- La dificultad: muchas entregas caen en el **mismo** bin a la vez. Hay que sumar sin perder cuentas: **atomics**.
+- Referencia en CPU: un bucle que suma 1 en el bin de cada entrega.
+
+### Dónde se usa en el programa
+- El resumen final (`statsJson`): el histograma de minutos de entrega.
+- Con `EQ_GPU=1` se calcula en la GPU a través del único hilo dueño de la GPU (commit de integración).
+
+### Diseño
+- **Privatización (la idea de la sesión 17).** Cada bloque tiene su **propia copia** de los 120 bins en shared memory (480 B, `extern __shared__`).
+- **Paso 1.** El bloque pone su copia en cero, `__syncthreads()`.
+- **Paso 2.** Cada thread recorre muchas entregas (grid-stride loop) y hace `atomicAdd` sobre la copia **en shared**: rápido y solo compiten los 256 threads del bloque.
+- **Paso 3.** `__syncthreads()`, y cada bloque vuelca a la memoria global solo sus bins distintos de cero, con un `atomicAdd` por bin.
+- **Cuánto baja la contención.** Sin privatización serían 32 millones de `atomicAdd` sobre 120 contadores globales. Con privatización son como mucho 240 bloques × 120 bins = **28 800**, más de 1000 veces menos.
+- **Block.** 256 threads (8 warps). **Grid.** Se limita a 8 bloques por SM (30 × 8 = 240): más bloques solo agregarían copias que volcar.
+- **Grid-stride loop.** Con 32 millones de entregas, cada thread procesa unas 520. Las lecturas son coalesced: en cada vuelta, el warp lee 32 tiempos consecutivos.
+- **Plantilla.** `HistKernels.h` deja el kernel como plantilla sobre «cómo se calcula el bin» (`WidthBin`).
+- **CPU N threads.** La misma idea: una copia privada por thread (`privatizedCpu`) y una suma final. Sin atomics ni locks.
+
+### Correctitud
+- Son conteos enteros: la GPU debe dar **exactamente** los mismos 120 números que `byWidthOne`. Sin tolerancia.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- El orden de los `atomicAdd` cambia en cada corrida, pero la suma de enteros no depende del orden: el resultado es determinista.
+- compute-sanitizer (`results/sanitizer_laptop_hist.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Racecheck revisa la copia en shared memory y sus dos barreras.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms.
+Fuente: `results/bench_laptop_hist.csv`, tabla de `analysis/report.ipynb`.
+Entradas: tiempos de entrega sintéticos con semilla fija (distribución gamma, media de unos 28 min).
+
+| size (entregas) | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|
+| 10⁴ | 0.026 | 0.026 (CPU 1) | 0.016 | 0.883 | 1.6 | 0.03 | yes |
+| 10⁵ | 0.254 | 0.254 (CPU 1) | 0.008 | 1.301 | 31.0 | 0.20 | yes |
+| 10⁶ | 2.625 | 1.117 (N=4) | 0.025 | 2.710 | 45.4 | 0.41 | yes |
+| 10⁷ | 28.130 | 7.442 (N=20) | 0.199 | 11.446 | 37.4 | 0.65 | yes |
+| 3.2 × 10⁷ | 81.856 | 17.523 (N=20) | 0.624 | 24.560 | 28.1 | 0.71 | yes |
+
+- **Tamaño del problema** = entregas: de 10⁴ a 3.2 × 10⁷, más de tres órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 1.8 % (10⁴), 0.6 %, 0.9 %, 1.7 %, 2.5 % (3.2 × 10⁷). **Más del 97 % es subir los tiempos de entrega.** Con 3.2 × 10⁷ entregas son 4 B × 3.2 × 10⁷ = 128 MB. La salida es mínima: 120 contadores (480 B).
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (3.2 × 10⁷, mediana).** 1 thread: 81.9 ms · 2: 45.8 · 4: 32.8 · 8: 24.0 · 14: 18.9 · 20: 17.5 ms.
+Speedup de 4.7× con 20 threads. Sigue mejorando hasta 20 threads, pero lejos de lo lineal: leer 128 MB de la RAM es el límite.
+
+![thread sweep](../results/thread_sweep.png)
+
+### Profiler (Nsight Compute, `privatized`, 10⁶ entregas, grid 240, block 256)
+| Métrica | Valor |
+|---|---|
+| Duration | 24.5 µs |
+| Theoretical / achieved occupancy | 100 % / 83.4 % |
+| Block limit: warps / registers / shared mem | 6 / 10 / 10 bloques |
+| Registers per thread · shared por bloque | 20 · 480 B (dinámica) |
+| Waves per SM | 1.33 |
+| Compute (SM) throughput | 26.4 % |
+| DRAM throughput | 70.1 % (197 GB/s) |
+| L1/TEX · L2 throughput | 15.8 % · 16.4 % |
+| L2 hit rate | 3.2 % |
+| Avg. active threads per warp | 31.9 de 32 |
+| Branch efficiency · divergent branches | 97.6 % · 7.7 |
+
+- **Occupancy.** 256 threads = 8 warps; caben 6 bloques por SM: teórica 100 %. Limitan los warps. La alcanzada es 83 %.
+- **Waves 1.33.** Con el límite de 240 bloques y 6 por SM (180 a la vez), la segunda tanda usa solo un tercio de la GPU. Eso explica en parte la diferencia entre ocupación teórica y alcanzada.
+- **Memory-bound.** La DRAM trabaja al 70 % y el cómputo al 26 %. Cada tiempo se lee una sola vez (L2 hit rate 3 %).
+- **Los atomics en shared no frenan.** El kernel va al ritmo de la DRAM, no de los atomics: la privatización cumple.
+- **Divergencia baja.** 31.9 de 32 threads activos y 97.6 % de branch efficiency. Viene de la última vuelta del grid-stride loop y del volcado (`if (local[b] != 0)`).
+
+### Roofline
+- Conteo por entrega: una división (el bin), un `min` y un `atomicAdd` (unas 3 operaciones) y 4 bytes leídos.
+- Intensidad aritmética: **0.75 op/byte**. Rendimiento alcanzado con 3.2 × 10⁷: **1.54 × 10¹¹ op/s**.
+- Ridge point ≈ 48 op/byte. Con 0.75 el kernel queda muy a la izquierda: **memory-bound**.
+- El techo de memoria en 0.75 op/byte es 0.75 × 336 GB/s = 2.52 × 10¹¹ op/s. El kernel llega al **61 %** de ese techo.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** La GPU tiene 46 080 threads residentes. Con 10⁴ entregas, 40 bloques × 256 = 10 240 threads: no llena la GPU y cada thread hace 1 entrega. Desde 10⁵ se usa el máximo de 240 bloques.
+- **Overheads.** El kernel es menos del 3 % del end to end. Subir los tiempos cuesta 40 a 170 veces más que contarlos.
+- **¿Los datos pueden quedarse en la GPU?** En el programa, no: los tiempos de entrega los registra el `EventLog` en la CPU, y el histograma se calcula **una vez**, al final. Habría que subirlos igual.
+- **Contención (lo propio del concepto).** Las entregas se concentran alrededor de 20–30 min: muchos threads golpean los mismos pocos bins. En shared memory compiten solo los 256 threads de un bloque, y la memoria global recibe como mucho 28 800 sumas en vez de 32 millones.
+- **Optimización antes/después.** No se midió una versión con atomics directos en global. La privatización es el diseño desde el principio.
+- **Sincronización.** Dos barreras por bloque (después de poner en cero y antes de volcar). Entre bloques no hay barreras: el volcado con `atomicAdd` en global es seguro en cualquier orden.
+- **Correctitud en paralelo.** Suma de enteros: el orden de los atomics no cambia el resultado.
+
+### Veredicto
+- **Crossover end to end: nunca.** La GPU no le gana a la mejor CPU en ningún tamaño (máximo 0.71×).
+- **El kernel solo gana desde 10⁵: 28–45×.** Lo que frena es subir los datos.
+- **Escala del brief:** unas decenas de entregas. **CPU** (1 thread, microsegundos).
+- **Ciudad (miles de entregas por hora simulada; el número exacto sale en la sección 5):** del orden de 10⁴. La CPU con 1 thread tarda unos 0.03 ms. **CPU.**
+- **Decisión: mantener la CPU.** La GPU solo convendría si los tiempos ya estuvieran en la GPU. Con la subida incluida, no gana en ningún tamaño medido.
+
+### Threats to validity
+- **Kernels muy cortos.** Con 10⁴ y 10⁵ el kernel dura 8–16 µs, con dispersión (de 6 a 77 µs con 10⁴).
+- **Dispersión de la CPU multithread.** Con 10⁷ y 20 threads: de 5.9 a 12.6 ms. Por eso se reporta la mediana.
+- **Distribución sintética.** Los tiempos de entrega son una gamma con semilla fija, no los de una corrida real. La contención real depende de cuánto se concentren en pocos bins.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_hist.csv --machine laptop --threads 1,2,4,8,14,20 --apps hist
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps hist
+done
+ncu --set full -k regex:"privatized" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps hist
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
