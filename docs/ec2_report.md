@@ -480,3 +480,126 @@ done
 ncu --set full -k regex:"privatized" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps hist
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
+
+## 3.5 Aplicación 5: entregas agrupadas por restaurante con counting sort y exclusive scan (09_scan)
+
+### Tarea y por qué es data-parallel
+- Al final de la simulación se quiere, por restaurante, cuántas entregas tuvo y su tiempo promedio.
+- Para eso se **agrupan** las entregas por restaurante: un **counting sort** estable.
+- Paso 1: contar cuántas entregas tiene cada restaurante. Paso 2: un **exclusive scan** de esos conteos da dónde empieza cada grupo (`offsets`). Paso 3: cada entrega se copia a su lugar (`order`).
+- El scan parece secuencial (cada suma depende de la anterior), pero es asociativo: se hace en árbol, en paralelo.
+- Referencia en CPU: `groupOne`, los tres pasos en un bucle cada uno.
+
+### Dónde se usa en el programa
+- El resumen final (`statsJson`): la lista `perRestaurant` (entregas y promedio por restaurante).
+- Con `EQ_GPU=1` se calcula en la GPU a través del único hilo dueño de la GPU (`Accel::groupByRestaurant`, commit de integración).
+
+### Diseño
+- **Chunks.** Las entregas se parten en chunks de 1024. Un bloque por chunk: con 4 × 10⁶ entregas son 3907 bloques.
+- **`countChunks`.** El bloque (256 threads) carga su chunk en shared memory (4 KB), 4 claves por thread, coalesced. Después el thread `r` cuenta cuántas veces aparece el restaurante `r` en el chunk. Escribe `counts[r][chunk]`.
+- **Sin atomics.** Cada contador tiene un solo dueño (un thread por restaurante y por chunk). No hay contención.
+- **Exclusive scan (Blelloch).** Sobre la tabla `counts` en orden restaurante-mayor. `scanBlocks` hace el árbol up-sweep / down-sweep en shared memory: 512 threads, 1024 valores por bloque. Si hay más de un bloque, se hace scan de las sumas de bloque (recursivo) y `addBlockSums` las suma de vuelta.
+- **Resultado del scan.** `starts[r][chunk]` = dónde escribe el chunk sus entregas del restaurante `r`. Los restaurantes quedan en orden y, dentro de cada uno, los chunks también: el orden es **estable**.
+- **`scatterChunks`.** Vuelve a cargar el chunk y el thread `r` copia, en orden, los índices de su restaurante a `order[pos++]`.
+- **`keyOffsets`.** Un bloque copia el inicio de cada restaurante a `offsets`.
+- **Por qué 256 threads si hay 64 restaurantes.** Los 256 cargan el chunk; después solo cuentan los primeros 64 (warps 0 y 1). Los otros 6 warps salen **enteros**: no se parte ningún warp, no hay divergencia.
+- **CPU N threads.** La misma idea: cada thread cuenta su rango en un arreglo **local**, un scan secuencial de la tabla `counts[restaurante][thread]` y cada thread copia su rango.
+
+### Correctitud
+- Son índices enteros: la GPU debe dar **exactamente** los mismos `offsets` y el mismo `order` que `groupOne`. Sin tolerancia.
+- El orden dentro de cada restaurante también tiene que coincidir: la comparación revisa que el sort sea estable.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- No hay atomics ni carreras: cada posición de `order` la escribe un solo thread. El resultado es determinista.
+- compute-sanitizer (`results/sanitizer_laptop_group.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Racecheck revisa el chunk en shared memory y el árbol del scan, con sus barreras.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms.
+Fuente: `results/bench_laptop_group.csv`, tabla de `analysis/report.ipynb`.
+Entradas: 64 restaurantes, semilla fija. La mitad de las entregas va a 8 restaurantes «populares»: grupos desparejos, como en la ciudad.
+
+| size (entregas) | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|
+| 10³ | 0.004 | 0.004 (CPU 1) | 0.090 | 1.404 | 0.05 | 0.003 | yes |
+| 10⁴ | 0.021 | 0.021 (CPU 1) | 0.046 | 1.190 | 0.45 | 0.02 | yes |
+| 10⁵ | 0.211 | 0.211 (CPU 1) | 0.189 | 1.377 | 1.1 | 0.15 | yes |
+| 10⁶ | 2.426 | 1.695 (N=4) | 0.333 | 5.273 | 5.1 | 0.32 | yes |
+| 4 × 10⁶ | 9.362 | 4.237 (N=4) | 1.131 | 9.721 | 3.7 | 0.44 | yes |
+
+- **Tamaño del problema** = entregas: de 10³ a 4 × 10⁶, más de tres órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+- La columna «GPU kernel» suma los 6 launches: `countChunks`, el scan (2 o 3 launches), `scatterChunks` y `keyOffsets`.
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 6.4 % (10³), 3.9 %, 13.7 %, 6.3 %, 11.6 % (4 × 10⁶). **Más del 86 % es copiar y reservar memoria.** Con 4 × 10⁶ entregas se suben 16 MB de claves y se bajan 16 MB de `order`.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (4 × 10⁶, mediana).** 1 thread: 9.36 ms · 2: 6.22 · 4: 4.24 · 8: 4.96 · 14: 5.16 · 20: 5.69 ms.
+El mejor es **4 threads** (2.2×). Con más empeora: la escritura de `order` salta por toda la memoria y con 4 threads ya satura la RAM. Con menos de 10⁵ entregas gana 1 thread: crear los threads cuesta más que el trabajo.
+
+![thread sweep](../results/thread_sweep.png)
+
+### Profiler (Nsight Compute, 10⁵ entregas, grid 98, block 256)
+| Métrica | `countChunks` | `scatterChunks` |
+|---|---|---|
+| Duration | 12.0 µs | 21.7 µs |
+| Theoretical / achieved occupancy | 100 % / 26.0 % | 100 % / 17.9 % |
+| Block limit: warps / registers / shared mem | 6 / 10 / 12 bloques | 6 / 6 / 12 bloques |
+| Registers per thread · shared por bloque | 18 · 4 KB | 34 · 4 KB |
+| Waves per SM | 0.54 | 0.54 |
+| Compute (SM) throughput | 42.1 % | 56.0 % |
+| DRAM throughput | 13.6 % | 9.9 % |
+| L1/TEX · L2 throughput | 25.7 % · 6.4 % | 61.3 % · 29.3 % |
+| L1/TEX · L2 hit rate | 10.8 % · 42.3 % | 77.1 % · 88.6 % |
+| Avg. active threads per warp | 32 de 32 | 32 de 32 |
+| Branch efficiency · divergent branches | 100 % · 0 | 100 % · 0 |
+
+- **Occupancy baja, por diseño.** La teórica es 100 % (limitan los warps), pero la alcanzada es 18–26 %. Después de cargar el chunk, 6 de los 8 warps terminan. Además 98 bloques son solo 0.54 waves: la GPU no se llena con 10⁵.
+- **Ni memory-bound ni compute-bound.** DRAM al 10–14 % y cómputo al 42–56 %. Lo que frena es el bucle de cada thread: recorre las 1024 claves del chunk una por una, y hay pocos warps para esconder la latencia.
+- **Shared memory sin bank conflicts.** En cada vuelta los 32 threads de un warp leen la **misma** clave `s[i]`: es un broadcast.
+- **Escrituras dispersas en `scatterChunks`.** Cada thread escribe en la zona de su restaurante: los 32 threads de un warp escriben en 32 lugares distintos (no coalesced). Por eso sube el tráfico de L1/L2 (61 % / 29 %).
+- **Divergencia nula.** 32 de 32 threads activos y 100 % de branch efficiency: los warps sobrantes salen enteros, y el `if (s[i] == r)` dentro del bucle no aparece como rama divergente (probablemente el compilador lo resuelve con predicación).
+
+### Roofline
+- Conteo por entrega: 64 comparaciones en `countChunks` y 64 en `scatterChunks` (128 operaciones). Bytes: la clave se lee 2 veces y se escribe el índice (12 bytes).
+- Intensidad aritmética: **10.7 op/byte**. Rendimiento alcanzado con 4 × 10⁶: **4.53 × 10¹¹ op/s**.
+- Ridge point ≈ 48 op/byte. Con 10.7 queda a la izquierda: el techo es la memoria, 10.7 × 336 GB/s = 3.58 × 10¹² op/s.
+- El kernel llega solo al **13 %** de ese techo. Coincide con ncu: no lo limita ningún techo, lo limitan la latencia y la poca occupancy.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** La GPU tiene 46 080 threads residentes. Con 10³ entregas hay 1 bloque: 64 threads trabajan. Con 10⁵, 98 bloques (0.54 waves). Recién con 10⁶ (977 bloques) y 4 × 10⁶ (3907) hay varias waves.
+- **Overheads.** El kernel es 4–14 % del end to end. Además son 6 launches: con tamaños chicos pesa más lanzar que calcular (10⁴: 0.046 ms de kernel para 0.021 ms de trabajo en la CPU).
+- **¿Los datos pueden quedarse en la GPU?** En el programa, no: las entregas las registra el `EventLog` en la CPU y la agrupación se hace **una vez**, al final. Hay que subir las claves y bajar `order`.
+- **Contención.** No hay atomics: el scan da a cada thread su propio rango de salida. Es la alternativa al histograma con atomics de la aplicación 4.
+- **Optimización antes/después en la GPU (probada y descartada).** Probé bloques de 64 threads (un thread por restaurante, sin warps sobrantes). Con 10⁵ entregas, en ncu, cada kernel salió **más lento**: `countChunks` 12.0 → 17.0 µs y `scatterChunks` 21.7 → 27.0 µs. Con 64 threads cada uno carga 16 claves en vez de 4, y la achieved occupancy bajó a 12–13 %. En el bench con 4 × 10⁶ la diferencia quedó dentro de la dispersión (1.09 contra 1.13 ms). Me quedé con 256.
+- **Optimización antes/después en la CPU (false sharing).** La primera versión de `groupMulti` sumaba directo en `counts[restaurante × threads + id]`: los contadores de threads distintos quedan juntos, en la misma cache line. Con 4 × 10⁶ entregas y 20 threads tardaba **63.6 ms**, 6 veces más que 1 thread. Con un arreglo local por thread bajó a **5.7 ms** (prueba rápida de 3 repeticiones). La tabla usa la versión corregida.
+- **Sincronización.** `countChunks` y `scatterChunks`: una barrera, después de cargar el chunk. El scan: una barrera por nivel del árbol (10 de subida y 10 de bajada). Entre kernels, el orden de los launches en el mismo stream hace de barrera global.
+- **Correctitud en paralelo.** Sumas de enteros y un dueño por posición: el resultado no depende del orden de los threads.
+
+### Veredicto
+- **Crossover end to end: nunca.** La GPU no le gana a la mejor CPU en ningún tamaño (máximo 0.44×).
+- **El kernel gana desde 10⁶: 3.7–5.1×.** Menos que en las otras aplicaciones: la occupancy es baja y hay 6 launches.
+- **Escala del brief:** unas decenas de entregas y pocos restaurantes. **CPU** (1 thread, microsegundos).
+- **Ciudad (miles de entregas por hora simulada; el número exacto sale en la sección 5):** del orden de 10³ a 10⁴. La CPU con 1 thread tarda 0.004–0.021 ms. **CPU.**
+- **Decisión: mantener la CPU.** Agrupar es barato en la CPU y la GPU paga la copia de ida y de vuelta.
+
+### Threats to validity
+- **Kernels muy cortos.** Con 10³ y 10⁴ el kernel dura 46–90 µs, con dispersión (de 36 a 197 µs con 10³).
+- **Dispersión de la CPU multithread.** Con 10⁶ y 20 threads: de 3.4 a 7.9 ms. Por eso se reporta la mediana.
+- **Distribución sintética.** 64 restaurantes y la mitad de las entregas en 8 de ellos. Con más de 256 restaurantes este diseño no sirve (un thread por restaurante en un bloque): `groupGpu` lo rechaza.
+- **ncu con 10⁵ entregas** (0.54 waves). Con 4 × 10⁶ la occupancy alcanzada debería ser mayor; no se perfiló ese tamaño.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_group.csv --machine laptop --threads 1,2,4,8,14,20 --apps group
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps group
+done
+ncu --set full -k regex:"countChunks|scatterChunks" -c 4 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps group
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
