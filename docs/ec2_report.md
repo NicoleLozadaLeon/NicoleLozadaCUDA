@@ -720,3 +720,136 @@ done
 ncu --set full -k regex:"convolve" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps conv
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
+
+## 3.7 Aplicación 7: mapa de cobertura de repartidores con un stencil iterativo (06_stencil)
+
+### Tarea y por qué es data-parallel
+- Se quiere saber qué zonas de Equipetrol están **lejos** de todo repartidor.
+- La grilla del mapa marca con 1 las celdas donde hay un repartidor (las «fuentes»). Después se repite **100 veces** (sweeps) un **stencil de 5 puntos**: cada celda pasa a ser 0.98 × el promedio de sus 4 vecinas (arriba, abajo, izquierda, derecha). Las fuentes se quedan en 1.
+- El valor «se difunde» desde los repartidores: cerca de uno, alto; lejos de todos, casi 0.
+- Dentro de un sweep, cada celda se calcula sola leyendo el sweep anterior: es data-parallel. Entre sweeps sí hay dependencia: el sweep `s + 1` necesita el `s` completo.
+- Referencia en CPU: `cpuOne`, 100 sweeps de un doble bucle.
+
+### Dónde se usa en el programa
+- El resumen final (`statsJson`): `leastCoveredNodes`, los 3 nodos del mapa con menos cobertura. Grilla de 10 m (190 × 271 celdas).
+- La ventana: el overlay `coverage`, cada 30 frames, con celdas de 25 m.
+- Los dos pasan por `Accel::coverage`. Con `EQ_GPU=1` lo ejecuta el único hilo dueño de la GPU (commit de integración).
+
+### Diseño
+- **Un thread por celda, un launch por sweep.** Block 16×16 (256 threads). 100 sweeps = 100 launches de `sweep`, más uno de `seed` para el estado inicial.
+- **Double buffering (ping-pong).** Dos grillas en la GPU, `a` y `b`. Cada sweep lee de una y escribe en la otra; después se intercambian los punteros (`std::swap`). Nadie lee una celda mientras otro la escribe.
+- **Barrera global = fin del launch.** Todos los launches van al mismo stream: el sweep `s + 1` no empieza hasta que termina el `s`. No hace falta sincronizar dentro del kernel.
+- **Los datos se quedan en la GPU** los 100 sweeps. Solo se sube la grilla de fuentes y se baja el resultado final: 2 copias para 100 sweeps.
+- **Lecturas coalesced.** Las vecinas izquierda y derecha son celdas contiguas; arriba y abajo son otras filas, también contiguas entre threads vecinos. Las relecturas las da L1/L2.
+- **Bordes.** Las vecinas fuera del mapa valen 0.
+- **CPU N threads.** Cada thread tiene una franja fija de filas. Después de cada sweep, todos esperan en una `Barrier` (mutex + condition variable): 100 barreras.
+
+### Correctitud
+- Son números `float`. La suma se escribe con paréntesis explícitos, `((up + down) + left) + right`, para que CPU y GPU sumen en el mismo orden.
+- Tolerancia: error relativo al máximo de la grilla **≤ 10⁻⁶** (`maxRelativeError`), después de los 100 sweeps.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- compute-sanitizer (`results/sanitizer_laptop_stencil.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Memcheck revisa los accesos de los bordes (`i - w`, `i + w`, `i - 1`, `i + 1`).
+- **Las 7 aplicaciones juntas** (`--size 0`, sin `--apps`): las 7 dan `[correct]` en el mismo binario.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms, para los **100 sweeps**.
+Fuente: `results/bench_laptop_stencil.csv`, tabla de `analysis/report.ipynb`.
+Entradas: el mapa de Equipetrol con celdas de 20 m a 1 m. Una celda de cada 100 es fuente, al azar, con semilla fija.
+
+| size (celda, grilla) | celdas | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|---|
+| 20 m, 95×136 | 1.3 × 10⁴ | 2.379 | 2.379 (CPU 1) | 0.841 | 2.021 | 2.8 | 1.18 | yes |
+| 10 m, 190×271 | 5.1 × 10⁴ | 9.331 | 6.552 (N=2) | 0.895 | 2.079 | 7.3 | 3.15 | yes |
+| 5 m, 380×542 | 2.1 × 10⁵ | 36.756 | 21.076 (N=2) | 1.404 | 3.506 | 15.0 | 6.01 | yes |
+| 2 m, 949×1354 | 1.3 × 10⁶ | 228.675 | 62.466 (N=20) | 5.729 | 10.942 | 10.9 | 5.71 | yes |
+| 1 m, 1898×2707 | 5.1 × 10⁶ | 924.235 | 208.815 (N=20) | 211.447 * | 238.362 * | 0.99 * | 0.88 * | yes |
+
+\* **La fila de 1 m está afectada por los clocks de la GPU** (ver abajo). Con la GPU a su clock normal: kernel **21.77 ms** y end to end **33.2 ms**: 9.6× y 6.3× contra la mejor CPU.
+
+- **Tamaño del problema** = celdas: de 1.3 × 10⁴ a 5.1 × 10⁶, más de dos órdenes de magnitud. Cada una se actualiza 100 veces.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+
+**La anomalía de 1 m.** En la corrida oficial, el kernel de 1 m va de 67 a 315 ms. Por escala debería ser unas 4 veces el de 2 m (≈ 23 ms).
+- Lo investigué con `nvidia-smi` cada 50 ms (`results/gpu_clocks_laptop_stencil_1m.txt`). En las repeticiones lentas la GPU está ocupada (89 %), pero el clock de SM está en **210–382 MHz** y la memoria en 780 MHz. Con el clock normal (1425 MHz o más) tarda 21.7 ms.
+- Es el ahorro de energía de la GPU de la laptop: a veces no sube el clock cuando empieza el trabajo. No es el kernel.
+- Una corrida corta solo de 1 m (`results/probe_laptop_stencil_1m_t20.csv`, 10 repeticiones, CPU con 20 threads) dio 8 de 10 repeticiones normales (21.7–28.6 ms) y 2 lentas (211 ms). Mediana: kernel 21.77 ms, end to end 33.2 ms.
+- **El archivo se llama `probe_…`** para que el notebook no lo mezcle con la tabla oficial.
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 41.6 % (20 m), 43.1 %, 40.0 %, 52.4 % (2 m). Con 1 m: 88.7 %, pero inflado por el clock bajo. Aquí las copias pesan poco: **una subida y una bajada para 100 sweeps**. Lo demás es reservar memoria y lanzar los 101 kernels.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (1 m, mediana).** 1 thread: 924.2 ms · 2: 515.2 · 4: 300.8 · 8: 235.3 · 14: 210.8 · 20: 208.8 ms.
+Speedup de **4.4×** con 20 threads. Mejora hasta 14 y después se estanca: cada sweep lee y escribe toda la grilla (41 MB) y la RAM es el límite.
+**Con grillas chicas, más threads es peor.** Con 20 m: 2.4 ms con 1 thread y 22.4 ms con 20. Son 100 barreras, y en cada una 20 threads se duermen y se despiertan (unos 0.2 ms por barrera). El trabajo de un sweep es mucho menor que eso.
+
+![thread sweep](../results/thread_sweep.png)
+
+### Profiler (Nsight Compute, `sweep`, 5 m 380×542, grid 24×34, block 16×16)
+| Métrica | Valor |
+|---|---|
+| Duration (un sweep) | 10.3 µs |
+| Theoretical / achieved occupancy | 100 % / 83.7 % |
+| Block limit: warps / registers / shared mem | 6 / 16 / 8 bloques |
+| Registers per thread · shared por bloque | 16 · 0 B |
+| Waves per SM | 4.53 |
+| Compute (SM) throughput | 27.4 % |
+| DRAM throughput | 62.9 % (211 GB/s) |
+| L1/TEX · L2 throughput | 39.7 % · 33.4 % |
+| L1/TEX · L2 hit rate | 51.6 % · 53.5 % |
+| Avg. active threads per warp | 31.0 de 32 |
+| Branch efficiency · divergent branches | 73.3 % · 14.5 |
+
+- **Occupancy.** 256 threads = 8 warps; caben 6 bloques por SM: teórica 100 %. Limitan los warps. La alcanzada es 84 %.
+- **Memory-bound.** La DRAM trabaja al 63 % y el cómputo al 27 %. 6 operaciones por celda contra 12 bytes movidos.
+- **Reuso parcial.** Hit rate de L1 52 % y de L2 54 %: cada celda la leen sus 4 vecinas; parte de esas relecturas sale de caché.
+- **La divergencia más alta de las 7 aplicaciones.** Branch efficiency 73 % y 31.0 de 32 threads activos. Viene del `if (sources[i] > 0)`: 1 de cada 100 celdas es fuente y termina antes; si un warp tiene una, ese thread toma otro camino. Se suman los `? :` de los bordes. Igual el costo es chico: el thread que diverge hace menos trabajo, no más.
+
+### Roofline
+- Conteo por celda y por sweep: 3 sumas y 2 multiplicaciones, más la comparación de la fuente (**6 operaciones**). Bytes: leer la fuente y la celda (más vecinas desde caché) y escribir (**12 bytes**).
+- Intensidad aritmética: **0.5 op/byte**. Ridge point ≈ 48 op/byte: muy a la izquierda, **memory-bound**.
+- Rendimiento alcanzado con 2 m: 100 × 6 × 1.28 × 10⁶ / 5.729 ms = **1.35 × 10¹¹ op/s**. Con 1 m y clock normal (21.77 ms): **1.42 × 10¹¹ op/s**.
+- El techo de memoria en 0.5 op/byte es 0.5 × 336 GB/s = 1.68 × 10¹¹ op/s. El kernel llega al **80–84 %** de ese techo, el más cerca del techo de las 7 aplicaciones.
+- **Ojo con el gráfico.** El roofline del notebook usa la mediana oficial de 1 m (1.46 × 10¹⁰ op/s), que está bajada por el clock. El valor con clock normal es el de arriba.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** La GPU tiene 46 080 threads residentes. Con 20 m hay 12 920 celdas por sweep: no la llena, y cada sweep dura unos 8 µs, casi solo el costo del launch. Desde 5 m (4.5 waves) sí la llena.
+- **Overheads.** Con 20 m y 10 m, el kernel total (0.84–0.90 ms) es casi igual: son 101 launches de unos 8 µs. El límite es lanzar, no calcular.
+- **¿Los datos pueden quedarse en la GPU?** Sí, y es la razón por la que esta aplicación gana. Los 100 sweeps se hacen sin volver a la CPU. Es lo opuesto a las aplicaciones 3 a 5, donde se copiaba todo para un solo paso.
+- **Optimización antes/después.** No se midió una versión con tiling en shared memory ni con varios sweeps por launch (temporal blocking). Sería la siguiente prueba para 1 m.
+- **Contención.** Ninguna: cada thread escribe una celda, en el buffer que nadie lee en ese sweep. No hay atomics.
+- **Sincronización.** En la GPU, 100 barreras globales gratis (el fin de cada launch). En la CPU, 100 `Barrier` que con muchos threads cuestan más que el trabajo en grillas chicas. **Aquí se ve la diferencia más clara entre los dos modelos de sincronización.**
+- **Correctitud en paralelo.** El double buffering evita las carreras; el mismo orden de suma da el mismo resultado dentro de 10⁻⁶.
+
+### Veredicto
+- **Crossover end to end: desde la grilla más chica (20 m, 1.18×).** La GPU gana en todos los tamaños con clock normal: 3.2× (10 m), 6.0× (5 m), 5.7× (2 m) y 6.3× (1 m, corrida corta).
+- **Escala del brief:** una grilla gruesa. Cerca del empate; **CPU 1 thread** (no se midió por debajo de 20 m).
+- **Ciudad: `leastCoveredNodes` usa celdas de 10 m (51 490 celdas).** CPU 6.55 ms contra GPU 2.08 ms: **3.2× a favor de la GPU. Usar la GPU.**
+- **Overlay de la ventana (25 m, unas 8 300 celdas):** por debajo de lo medido; cerca del empate. Por ser asíncrono (`std::future`), cualquiera de los dos sirve sin trabar la ventana.
+- **Decisión: GPU para la cobertura en el programa.** Es la única de las 7 aplicaciones que conviene en la GPU al tamaño real de la ciudad, porque los 100 sweeps se quedan en la GPU.
+
+### Threats to validity
+- **Clocks de la GPU de la laptop.** La fila de 1 m de la tabla oficial está afectada por el clock bajo (210–382 MHz). Se reporta tal cual y, aparte, la corrida corta. También hubo una repetición lenta con 2 m (131 ms; la mediana es 5.73 ms).
+- **Kernels muy cortos.** Con 20 m un sweep dura unos 8 µs: la medida es casi el costo del launch en WSL2.
+- **Dispersión de la CPU multithread.** Con 10 m y 20 threads: de 22.4 a 43.5 ms. Por eso se reporta la mediana.
+- **Entrada sintética.** Fuentes al azar (1 %). El tiempo casi no depende de los valores; solo la divergencia depende de cuántas fuentes hay.
+- **ncu con 5 m.** Con 5 m los buffers (0.8 MB cada uno) entran en la L2 de 3 MB; con 1 m no. Con 1 m el DRAM throughput debería ser mayor; no se perfiló ese tamaño.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_stencil.csv --machine laptop --threads 1,2,4,8,14,20 --apps stencil
+./build-gpu/delivery_sim config/equipetrol.json --apps stencil --size 4 --bench results/probe_laptop_stencil_1m_t20.csv --machine laptop --threads 20 --reps 10
+nvidia-smi --query-gpu=timestamp,clocks.sm,clocks.mem,pstate,power.draw,utilization.gpu --format=csv -lms 50   # en otra terminal, durante el bench
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps stencil
+done
+ncu --set full -k regex:"sweep" -c 2 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 2 --reps 1 --threads 2 --apps stencil
+./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/all.csv --reps 1 --size 0   # las 7 aplicaciones juntas
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
