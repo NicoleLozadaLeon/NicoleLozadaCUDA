@@ -1001,3 +1001,158 @@ ncu --set full -k regex:"countTiled|countNaive" -c 4 --csv --page details ./buil
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
 La prueba del orden (`probe_laptop_near_order.csv`) se hizo invirtiendo temporalmente el orden de los tres `addGpu` en `BenchNearby.cpp` y corriendo `--size 3 --threads 4`.
+
+## 3.9 Aplicación 9 (2ª de 04_performance): comida esperando, con los pedidos de las bolsas como SoA
+
+### Tarea y por qué es data-parallel
+- Cada repartidor lleva una bolsa con pedidos. Un pedido de la bolsa que todavía no se recogió puede estar **listo** (la comida ya está preparada) y esperar al repartidor.
+- Para cada pedido se calcula **cuánto tiempo lleva listo sin recogerse**: `ahora − readyAtMs`. Vale `0` si ya se recogió o si todavía no está listo.
+- Es un dato de calidad de una operación de delivery: la comida lista que espera se enfría. El programa todavía no lo muestra.
+- Cada pedido se evalúa solo: es data-parallel.
+- **Patrón del curso (sesión 14, coalescing y SoA vs AoS).** Es el mismo patrón de la aplicación 2, con otra tarea y **casi sin cálculo**: se ve el efecto del layout de los datos solo.
+- Referencia en CPU: `cpuOne`, un bucle sobre los pedidos.
+
+**Definición y límites (en palabras simples):**
+- «Esperando» = listo y **todavía no está en la mochila** del repartidor.
+- **Solo cuenta pedidos que ya tienen repartidor.** Los que esperan en el `OrderBook` o se están asignando no aparecen: el programa no deja leer su hora de listo.
+- **Cuenta también la comida que el repartidor ya está recogiendo.** La vista del repartidor expone `pickedUp` pero no `pickupStarted`, así que mientras la recoge sigue figurando como «sin recoger».
+
+### Dónde se usa en el programa
+- Los pedidos de las bolsas salen de `Courier::view().bag`, con `restaurantNode`, `deliveryNode`, `readyAtMs` y `pickedUp`. El `Dispatcher` ya usa esos mismos campos para calcular el ETA.
+- No hace falta ningún método ni atributo nuevo en las clases del programa.
+- El resumen final muestra «comida esperando». Con `EQ_GPU=1` se calcula a través del único hilo dueño de la GPU (commit de integración, que junta las bolsas de todos los repartidores en un arreglo).
+
+### Diseño
+- **Datos SoA.** Solo los dos campos que el chequeo lee, cada uno en su arreglo: `readyAtMs[i]` (8 B) y `pickedUp[i]` (1 B). La salida es 1 `int` por pedido (4 B).
+- **Datos AoS (para comparar).** Una ficha `ItemAoS` de **24 bytes** con los mismos cuatro campos que `Courier::View::Item`. El kernel usa 2: **9 de los 24 bytes**.
+- **Block y grid.** 256 threads (8 warps), grid de `ceil(n / 256)` bloques. Un thread por pedido, un solo launch.
+- **Coalescing, SoA:** los 32 threads de un warp leen 32 `long long` seguidos (256 B) y 32 bytes seguidos, y todo se usa.
+- **Coalescing, AoS:** un warp toca 32 fichas × 24 B = **768 B** para usar 288 B.
+- **Sin shared memory, sin barreras, sin atomics.**
+- **CPU N threads.** `parallelFor` reparte rangos contiguos de pedidos. Cada thread escribe solo su rango.
+
+### Correctitud
+- Son enteros: las dos versiones de GPU y la CPU con N threads deben dar **exactamente** el mismo resultado que `cpuOne`. Sin tolerancia.
+- Entrada de prueba: «listo» al azar entre 10 min antes y 10 min después de «ahora», y el 30 % de los pedidos ya recogido. Cerca del 35 % de los pedidos da un valor mayor que 0.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- compute-sanitizer (`results/sanitizer_laptop_foodwait.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. No hay shared memory, así que racecheck no tiene nada que revisar.
+- **Check-then-act.** El resultado es una foto en el instante «ahora». `view()` toma cada repartidor por separado, así que la foto de toda la flota no es atómica. Es solo informativo: no cambia ningún pedido ni toca ningún invariante del brief.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms. GPU = versión SoA.
+Fuente: `results/bench_laptop_foodwait.csv`, tabla de `analysis/report.ipynb`.
+Entradas: pedidos sintéticos con semilla fija. «Ahora» = 2 h simuladas. **6000 pedidos = las bolsas de `city_60` como máximo** (2000 repartidores × bolsa de 3).
+
+| size (pedidos en bolsas) | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|
+| 10³ | 0.008 | 0.008 (CPU 1) | 0.027 | 0.745 | 0.28 | 0.010 | yes |
+| **6 × 10³ (ciudad)** | 0.043 | 0.043 (CPU 1) | 0.009 | 0.668 | 4.7 | **0.064** | yes |
+| 10⁵ | 0.660 | 0.365 (N=4) | 0.048 | 0.931 | 7.6 | 0.39 | yes |
+| 10⁶ | 6.804 | 1.866 (N=14) | 0.125 | 4.149 | 14.9 | 0.45 | yes |
+| 4 × 10⁶ | 26.601 | 4.348 (N=20) | 0.217 | 9.925 | 20.0 | 0.44 | yes |
+
+- **Tamaño del problema** = pedidos en bolsas: de 10³ a 4 × 10⁶, 3.6 órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+- Los tiempos de CPU y de GPU incluyen reservar y poner en cero el arreglo de salida.
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 3.6 % (10³), 1.4 %, 5.1 %, 3.0 %, 2.2 % (4 × 10⁶). **Más del 94 % es copiar y reservar memoria.** Con 4 × 10⁶ pedidos se suben 9 B × 4 × 10⁶ = 36 MB y se bajan 16 MB.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (4 × 10⁶, mediana).** 1 thread: 26.6 ms · 2: 13.9 · 4: 7.40 · 8: 5.22 · 14: 4.43 · 20: 4.35 ms.
+Speedup de **6.1×** con 20 threads (eficiencia 31 %). Mejora hasta 14 threads y después se estanca.
+La CPU con 1 thread tarda unos 6.8 ns por pedido (13 MB en 6.8 ms con 10⁶, unos 2 GB/s): **no está limitada por el ancho de banda de la RAM**. Probablemente la frenan las ramas, que se predicen mal con valores al azar, y reservar la salida. No se midió.
+
+![thread sweep](../results/thread_sweep.png)
+
+### SoA vs AoS (el antes/después del coalescing)
+Mediana del kernel y del end to end, en ms. El ancho de banda efectivo cuenta solo los bytes **útiles**: 8 + 1 + 4 = 13 B por pedido.
+
+| size | SoA kernel | AoS kernel | AoS / SoA | SoA e2e | AoS e2e | AoS / SoA | GB/s útiles SoA | AoS |
+|---|---|---|---|---|---|---|---|---|
+| 10³ | 0.027 | 0.009 | 0.34 | 0.745 | 0.564 | 0.76 | 0.5 | 1.4 |
+| 6 × 10³ | 0.009 | 0.040 | 4.3 | 0.668 | 0.554 | 0.83 | 8.5 | 2.0 |
+| 10⁵ | 0.048 | 0.044 | 0.92 | 0.931 | 1.294 | 1.39 | 27.2 | 29.7 |
+| 10⁶ | 0.125 | 0.136 | 1.09 | 4.149 | 5.050 | 1.22 | 104.2 | 95.3 |
+| 4 × 10⁶ | 0.217 | 0.412 | **1.90** | 9.925 | 16.788 | **1.69** | 239.6 | 126.1 |
+
+- **Con 4 × 10⁶, SoA es 1.9× más rápido en el kernel y 1.7× en el end to end.** En el end to end SoA también copia menos bytes (9 contra 24 por pedido).
+- **Con 10⁶ la diferencia por eventos es de solo 1.09×, pero en Nsight Compute es 2.2×** (43 µs contra 95 µs, ver abajo). A ese tamaño el kernel dura 125–136 µs por eventos, y una parte es el costo de lanzarlo.
+- **Con 10³ a 10⁵ el kernel no sirve para comparar.** Dura 9–48 µs, con mucha dispersión: el kernel SoA de 6000 va de 8 a 463 µs entre repeticiones.
+- **El orden de las versiones cambia el end to end con tamaños chicos.** En la tabla, AoS parece ganar con 10³ y 6000. Es un efecto del orden: la primera versión de GPU que corre después de las de CPU paga unos 0.1–0.2 ms extra, y `gpu` (SoA) va primera. Lo comprobé invirtiendo el orden (`results/probe_laptop_foodwait_order.csv`, `--threads 4`):
+
+| size | SoA e2e, orden oficial | SoA e2e, invertido | AoS e2e, orden oficial | AoS e2e, invertido |
+|---|---|---|---|---|
+| 10³ | 0.745 | 0.568 | 0.564 | 0.558 |
+| 6 × 10³ | 0.668 | 0.586 | 0.554 | 0.596 |
+| 10⁶ | 4.149 | 3.446 | 5.050 | 5.421 |
+
+  Con el orden invertido, SoA y AoS **empatan** con 10³ y 6000. Con 10⁶ SoA gana en los dos órdenes (1.2× y 1.6×). **En la tabla de resultados SoA va primera: es el número pesimista para SoA.**
+
+### Profiler (Nsight Compute, 10⁶ pedidos, grid 3907, block 256)
+| Métrica | `foodWaitSoA` | `foodWaitAoS` |
+|---|---|---|
+| Duration | 43.4 µs | 94.8 µs |
+| Theoretical / achieved occupancy | 100 % / 89.1 % | 100 % / 88.4 % |
+| Block limit: warps / registers / shared mem | 6 / 16 / 8 bloques | 6 / 16 / 8 bloques |
+| Registers per thread · shared por bloque | 16 · 0 B | 16 · 0 B |
+| Waves per SM | 21.7 | 21.7 |
+| Compute (SM) throughput | 14.8 % | 6.4 % |
+| DRAM throughput | 87.1 % (292 GB/s) | 89.2 % (299 GB/s) |
+| L1/TEX · L2 throughput | 19.8 % · 28.9 % | 19.5 % · 46.9 % |
+| L1/TEX · L2 hit rate | 0 % · 30.9 % | 46.2 % · 14.4 % |
+| Avg. active threads per warp | 32 de 32 | 32 de 32 |
+| Divergent branches | 0 | 0 |
+
+- **Memory-bound en las dos versiones.** La DRAM está al 87–89 % y el cómputo al 6–15 %. Las dos usan casi todo el ancho de banda; la diferencia es **cuántos bytes mueven**.
+- **SoA mueve unos 13 MB** (9 B leídos y 4 B escritos por pedido): 292 GB/s durante 43 µs.
+- **AoS mueve unos 28 MB** (24 B leídos y 4 B escritos): 299 GB/s durante 95 µs. Lee la ficha entera aunque use 9 B, porque los campos que no usa están intercalados en los mismos sectores de 32 B. **2.2 veces más bytes, 2.2 veces más tiempo.**
+- **Occupancy.** 256 threads = 8 warps; caben 6 bloques por SM: teórica 100 %. Limitan los warps (los registros y la shared memory permitirían 16 y 8). La alcanzada es 89 % en las dos.
+- **Sin divergencia.** 32 de 32 threads activos y 0 ramas divergentes, aunque los valores sean al azar. Probablemente el compilador convirtió el `if` en una selección sin salto. Nsight Compute muestra «branch efficiency 0 %», probablemente porque no hay ramas que contar.
+- **L2.** AoS pasa más tráfico por la L2 (47 % contra 29 %) para el mismo trabajo.
+
+### Roofline
+- Conteo por pedido: 2 comparaciones, 1 resta y 1 selección con tope (**4 operaciones enteras**). Bytes: 9 leídos y 4 escritos (**13 B**, SoA).
+- Intensidad aritmética: **0.31 op/byte**. Ridge point ≈ 48: muy a la izquierda, **memory-bound**.
+- Rendimiento alcanzado con 4 × 10⁶, tiempo por eventos (0.217 ms): **7.4 × 10¹⁰ op/s**. El techo de memoria en 0.31 op/byte es 0.3077 × 336 GB/s = 1.03 × 10¹¹ op/s: llega al **71 %**.
+- Con el tiempo de Nsight Compute (43 µs con 10⁶): 9.2 × 10¹⁰ op/s, el **89 %** del techo, coherente con la DRAM al 87 %. Son dos medidas distintas: la del gráfico es la de eventos, que incluye el launch.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** Cada pedido es un thread. La GPU tiene 46 080 threads residentes. Con 10³ pedidos hay 4 bloques; con los 6000 de la ciudad, 24; con 10⁵, 391 (2.2 waves); con 10⁶, 3907 (21.7 waves). No se llena hasta 10⁶.
+- **Overheads.** El kernel es entre el 1 y el 5 % del end to end. Subir y bajar los datos cuesta entre 19 y 74 veces más que calcular.
+- **¿Los datos pueden quedarse en la GPU?** En el programa, no: las bolsas viven en cada `Courier` y hay que juntarlas en un arreglo en cada consulta. Si las bolsas vivieran en la GPU como arreglos SoA, solo habría que bajar el resultado. No se midió.
+- **Memory-bound y coalescing.** La respuesta de esta aplicación es SoA contra AoS: **1.9× en el kernel con 4 × 10⁶, 2.2× en ncu con 10⁶ y 1.7× en el end to end con 4 × 10⁶.**
+- **Optimización antes/después.** SoA contra AoS es el antes/después del layout. No se midió: memoria pinned para la copia, ni los datos residentes en la GPU.
+- **Contención y sincronización.** Ninguna: sin atomics, sin barreras, sin shared memory.
+- **Correctitud en paralelo.** Enteros: determinista. El detalle del check-then-act está en Correctitud.
+
+### Veredicto
+- **Crossover end to end: nunca.** La GPU no le gana a la mejor CPU en ningún tamaño (máximo 0.45×).
+- **El kernel gana desde 6 × 10³: 4.7–20×.** Pero el kernel es menos del 5 % del tiempo total.
+- **Escala del brief (8 repartidores × bolsa de 3: como máximo 24 pedidos):** menos de 1 µs. **CPU.**
+- **Ciudad (`city_60`, unos 6000 pedidos en bolsas como máximo):** la CPU con 1 thread tarda 0.043 ms y la GPU 0.67 ms end to end (0.064×). **CPU.**
+- **Decisión: mantener la CPU.** Lo que sí deja esta aplicación: **si algún día se calcula en la GPU, SoA es el layout correcto,** de 1.7 a 1.9× más rápido que AoS con 4 × 10⁶.
+
+### Threats to validity
+- **Kernels muy cortos.** Con 10³ a 10⁵ el kernel dura 9–48 µs, con dispersión (SoA con 6000: de 8 a 463 µs). La comparación SoA contra AoS del kernel solo es confiable desde 4 × 10⁶.
+- **Orden de las versiones.** La primera versión de GPU paga 0.1–0.2 ms extra con tamaños chicos (ver arriba). La tabla de resultados pone SoA primera.
+- **Eventos contra ncu.** Con 10⁶ el kernel SoA mide 125 µs por eventos y 43 µs en ncu. El tiempo por eventos incluye el launch y el estado de reloj de la GPU de la laptop, que varía (ver la sección 3.7).
+- **Dispersión de la CPU multithread.** Con 4 × 10⁶ y 20 threads: de 3.9 a 5.3 ms. Por eso se reporta la mediana.
+- **Entrada sintética.** Valores al azar y 30 % recogidos. En el programa, la bolsa de cada repartidor tiene como mucho 3 pedidos, y solo se cuentan pedidos ya asignados.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_foodwait.csv --machine laptop --threads 1,2,4,8,14,20 --apps foodwait
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps foodwait
+done
+ncu --set full -k regex:"foodWaitSoA|foodWaitAoS" -c 4 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 3 --reps 1 --threads 2 --apps foodwait
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
+La prueba del orden (`probe_laptop_foodwait_order.csv`) se hizo invirtiendo temporalmente el orden de los dos `addGpu` en `BenchFoodWait.cpp` y corriendo `--size 0`, `--size 1` y `--size 3` con `--threads 4`.

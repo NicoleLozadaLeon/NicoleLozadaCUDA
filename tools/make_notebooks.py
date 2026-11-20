@@ -80,6 +80,10 @@ REPORT = [
     ("code", "m = med[(med.app == 'eta') & (med.machine == GPU_MACHINE) & med.version.isin(['gpu_kernel', 'gpu_aos_kernel'])]\n"
              "bw = m.assign(GBps=20 * m['size'] / (m['median'] / 1000) / 1e9)\n"
              "bw.pivot(index='size_label', columns='version', values='GBps').round(1)"),
+    ("md", "## AoS vs SoA (application foodwait): effective bandwidth\nUseful bytes per order in a bag: readyAtMs 8 + pickedUp 1 + the output 4 = 13 bytes."),
+    ("code", "m = med[(med.app == 'foodwait') & (med.machine == GPU_MACHINE) & med.version.isin(['gpu_kernel', 'gpu_aos_kernel'])]\n"
+             "bw = m.assign(GBps=13 * m['size'] / (m['median'] / 1000) / 1e9)\n"
+             "bw.pivot(index='size_label', columns='version', values='GBps').round(1)"),
     ("md", "## Roofline (RTX 3060 Laptop: 3840 CUDA cores x 2 FLOP x 2.1 GHz = 16.1 TFLOP/s FP32; 192-bit GDDR6 at 14 Gbps = 336 GB/s)\nFLOP and byte counts per kernel, derived from the code "
            "(write the derivation in the report). Achieved performance uses the kernel time at the largest size."),
     ("code", "PEAK_FLOPS, PEAK_BW = 2 * 3840 * 2.1e9, 336e9\n"
@@ -95,6 +99,7 @@ REPORT = [
              "    if app == 'conv': return 2 * 25 * n, 8 * n\n"
              "    if app == 'stencil': return 100 * 6 * n, 100 * 12 * n\n"
              "    if app == 'near': return 7 * n, 8 * n / 128\n"
+             "    if app == 'foodwait': return 4 * n, 13 * n\n"
              "    return np.nan, np.nan\n"
              "pts = []\n"
              "for app in APPS:\n"
