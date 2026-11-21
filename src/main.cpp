@@ -145,6 +145,8 @@ int main(int argc, char** argv) {
         }
         sim.stop();
         std::cerr << sim.dispatcher().statsLine() << "\n";
+        if (window) std::cerr << "window: frames=" << window->frames() << " fps=" << window->fps() << "\n";
+        std::cout << sim.statsJson(args.logPath) << std::endl;
         std::cout << sim.log().summaryJson() << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

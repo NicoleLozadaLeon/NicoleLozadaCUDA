@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "Accel.h"
 #include "Config.h"
 #include "Dispatcher.h"
 #include "EstimatePool.h"
@@ -32,8 +33,11 @@ public:
     const Dispatcher& dispatcher() const { return dispatcher_; }
     const std::vector<std::shared_ptr<Restaurant>>& restaurants() const { return restaurants_; }
     std::string graphReport() const;
+    std::string statsJson(const std::string& logPath) const;  // logPath: the events.log of this run (3.11)
+    Accel& accel() const { return accel_; }
 private:
     const Config& cfg_;
+    mutable Accel accel_;
     Graph graph_;
     SimClock clock_;
     EventLog log_;

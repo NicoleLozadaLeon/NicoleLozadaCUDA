@@ -11,6 +11,7 @@ struct Settings {
     double failEstimateProbability = 0.0;
     int graphTasks = 0;
     int graphGrain = 4;
+    bool gpu = false;
     const char* estimatesName() const {
         switch (estimates) {
             case Estimates::Async: return "async";
@@ -32,6 +33,7 @@ struct Settings {
         if (const char* v = std::getenv("EQ_FAIL_ESTIMATE")) s.failEstimateProbability = std::clamp(std::atof(v), 0.0, 1.0);
         if (const char* v = std::getenv("EQ_GRAPH_TASKS")) s.graphTasks = std::max(0, std::atoi(v));
         if (const char* v = std::getenv("EQ_GRAPH_GRAIN")) s.graphGrain = std::max(0, std::atoi(v));
+        if (const char* v = std::getenv("EQ_GPU")) s.gpu = std::string(v) == "1";
         return s;
     }
 };

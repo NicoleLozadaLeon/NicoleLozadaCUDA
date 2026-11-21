@@ -10,6 +10,8 @@
 #include <thread>
 #include <utility>
 
+#include "Accel.h"
+
 namespace {
 
 double haversine_m(double lat1, double lon1, double lat2, double lon2) {
@@ -26,7 +28,7 @@ double haversine_m(double lat1, double lon1, double lat2, double lon2) {
 
 }
 
-Graph::Graph(const Config& cfg, int tasks, int grain) {
+Graph::Graph(const Config& cfg, int tasks, int grain, Accel* accel) {
     const int n = static_cast<int>(cfg.nodes.size());
     ids_.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
@@ -56,6 +58,11 @@ Graph::Graph(const Config& cfg, int tasks, int grain) {
     tasksUsed_ = std::max(1, std::min(tasks > 0 ? tasks : static_cast<int>(hw), n));
     grain_ = grain;
     const auto t0 = std::chrono::steady_clock::now();
+    if (accel && accel->gpu()) {
+        buildWithAccel(*accel);
+        buildMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
     std::atomic<int> nextSource{0};
     std::vector<std::future<void>> parts;
     if (grain > 0) {
@@ -73,6 +80,50 @@ Graph::Graph(const Config& cfg, int tasks, int grain) {
     for (std::future<void>& part : parts) part.get();
     buildMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
+}
+
+int Graph::edgeDm(const Edge& e) { return std::max(1, static_cast<int>(std::lround(e.meters * 10.0))); }
+
+void Graph::buildWithAccel(Accel& accel) {
+    const int n = nodeCount();
+    floyd::Network net;
+    net.n = n;
+    net.rowStart.push_back(0);
+    for (const std::vector<Edge>& edges : adj_) {
+        for (const Edge& e : edges) {
+            net.to.push_back(e.to);
+            net.weight.push_back(edgeDm(e));
+        }
+        net.rowStart.push_back(static_cast<int>(net.to.size()));
+    }
+    distDm_ = accel.allPairs(net);
+    for (std::size_t i = 0; i < distDm_.size(); ++i)
+        dist_[i] = distDm_[i] >= floyd::kInf ? kUnreachable : distDm_[i] / 10.0;
+    const int chunk = (n + tasksUsed_ - 1) / tasksUsed_;
+    std::vector<std::future<void>> parts;
+    for (int t = 0; t < tasksUsed_; ++t) {
+        const int begin = t * chunk;
+        const int end = std::min(n, begin + chunk);
+        if (begin >= end) break;
+        parts.push_back(std::async(std::launch::async, &Graph::firstHops, this, begin, end));
+    }
+    for (std::future<void>& part : parts) part.get();
+    builtOnGpu_ = accel.device();
+}
+
+void Graph::firstHops(int begin, int end) {
+    const std::size_t N = ids_.size();
+    for (int s = begin; s < end; ++s)
+        for (std::size_t t = 0; t < N; ++t) {
+            const int d = distDm_[static_cast<std::size_t>(s) * N + t];
+            if (static_cast<std::size_t>(s) == t || d >= floyd::kInf) continue;
+            for (const Edge& e : adj_[static_cast<std::size_t>(s)]) {
+                if (edgeDm(e) + distDm_[static_cast<std::size_t>(e.to) * N + t] == d) {
+                    next_[static_cast<std::size_t>(s) * N + t] = e.to;
+                    break;
+                }
+            }
+        }
 }
 
 void Graph::claimSources(std::atomic<int>& next, int grain) {

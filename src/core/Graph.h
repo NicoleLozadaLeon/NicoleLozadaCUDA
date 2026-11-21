@@ -7,6 +7,8 @@
 
 #include "Config.h"
 
+class Accel;
+
 class Graph {
 public:
     static constexpr double kUnreachable = std::numeric_limits<double>::infinity();
@@ -16,7 +18,7 @@ public:
         double meters;
         int street;
     };
-    explicit Graph(const Config& cfg, int tasks = 0, int grain = 4);
+    explicit Graph(const Config& cfg, int tasks = 0, int grain = 4, Accel* accel = nullptr);
 
     int nodeCount() const;
     int indexOf(const std::string& id) const;
@@ -32,8 +34,13 @@ public:
     double buildMs() const { return buildMs_; }
     int tasksUsed() const { return tasksUsed_; }
     int grain() const { return grain_; }
+    bool builtOnGpu() const { return builtOnGpu_; }
+    const std::vector<int>& distDm() const { return distDm_; }
 
 private:
+    static int edgeDm(const Edge& e);
+    void buildWithAccel(Accel& accel);
+    void firstHops(int begin, int end);
     void shortestPathsFrom(int source);
     void claimSources(std::atomic<int>& next, int grain);
     void sourceRange(int begin, int end);
@@ -43,6 +50,8 @@ private:
     std::vector<std::vector<Edge>> adj_;
     std::vector<double> dist_;
     std::vector<int> next_;
+    std::vector<int> distDm_;
+    bool builtOnGpu_ = false;
     double buildMs_ = 0.0;
     int tasksUsed_ = 1;
     int grain_ = 0;

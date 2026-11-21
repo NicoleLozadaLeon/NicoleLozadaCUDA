@@ -28,17 +28,23 @@ long long EventLog::orderCreated(const std::string& order, const std::string& re
     return t;
 }
 
-void EventLog::orderDelivered(const std::string& order, const std::string& courier) {
+void EventLog::orderDelivered(const Order& order, const std::string& courier) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const long long t = emit_("orderDelivered", {{"order", order}, {"courier", courier}});
+    const long long t = emit_("orderDelivered", {{"order", order.id}, {"courier", courier}});
     ++counters_.delivered;
     ++counters_.deliveredPerCourier[courier];
-    const auto it = createdAt_.find(order);
+    const auto it = createdAt_.find(order.id);
     if (it != createdAt_.end()) {
         const long long duration = t - it->second;
         totalDeliveryMs_ += duration;
         counters_.maxDeliveryMs = std::max(counters_.maxDeliveryMs, duration);
+        deliveries_.push_back({order.restaurant, order.deliveryNode, it->second, t});
     }
+}
+
+std::vector<EventLog::Delivery> EventLog::deliveries() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return deliveries_;
 }
 
 void EventLog::registerCourier(const std::string& courier) {

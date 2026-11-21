@@ -19,3 +19,14 @@ name, driver_version, clocks.max.sm [MHz], memory.total [MiB]
 NVIDIA GeForce RTX 3060 Laptop GPU, 610.91, 2100 MHz, 6144 MiB
 Cuda compilation tools, release 13.3, V13.3.73
 Build cuda_13.3.r13.3/compiler.38244171_0
+== Windows (PowerShell, the rubric's command; WSL2 shows a virtual 10x2 topology)
+Name                      : 12th Gen Intel(R) Core(TM) i9-12900H
+NumberOfCores             : 14
+NumberOfLogicalProcessors : 20
+TotalPhysicalMemoryGB: 15.7
+Microsoft Windows 11 Home 10.0.26300
+== build flags
+CMAKE_BUILD_TYPE:STRING=Release
+CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=86
+CMAKE_CUDA_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
