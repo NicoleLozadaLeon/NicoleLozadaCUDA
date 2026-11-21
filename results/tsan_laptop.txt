@@ -1,0 +1,8 @@
+EQ_GPU=0 stress: TSan warnings=0, mode=pool
+OK: 1930 orders, 8 delivered, 1894 rejected, 28 pending, 139 reassigned, 160 breakdowns
+EQ_GPU=0 breakdowns: TSan warnings=0, mode=pool
+OK: 1546 orders, 10 delivered, 1464 rejected, 72 pending, 107 reassigned, 100 breakdowns
+EQ_GPU=1 stress: TSan warnings=0, mode=gpu
+OK: 1930 orders, 8 delivered, 1895 rejected, 27 pending, 128 reassigned, 156 breakdowns
+EQ_GPU=1 breakdowns: TSan warnings=0, mode=gpu
+OK: 1540 orders, 8 delivered, 1461 rejected, 71 pending, 119 reassigned, 98 breakdowns

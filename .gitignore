@@ -4,3 +4,8 @@ build*/
 __pycache__/
 runs/
 !experiments/*.log
+bench_once.csv
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+config/city/

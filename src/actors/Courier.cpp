@@ -101,7 +101,7 @@ bool Courier::deliverAt(int node) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = bag_.begin(); it != bag_.end();) {
             if (it->pickedUp && it->order.deliveryNode == node) {
-                log_.orderDelivered(it->order.id, id_);
+                log_.orderDelivered(it->order, id_);
                 it = bag_.erase(it);
             } else {
                 ++it;

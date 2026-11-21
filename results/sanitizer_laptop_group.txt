@@ -1,0 +1,12 @@
+========= COMPUTE-SANITIZER
+bench: machine=laptop gpu=NVIDIA GeForce RTX 3060 Laptop GPU cpuThreads=20 reps=1
+group 1000: cpu1=0.004 cpuN2=0.535 gpu_e2e=4.666 gpu_kernel=2.622  [correct]
+========= ERROR SUMMARY: 0 errors
+========= COMPUTE-SANITIZER
+bench: machine=laptop gpu=NVIDIA GeForce RTX 3060 Laptop GPU cpuThreads=20 reps=1
+group 1000: cpu1=0.004 cpuN2=0.534 gpu_e2e=51.707 gpu_kernel=46.589  [correct]
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+========= COMPUTE-SANITIZER
+bench: machine=laptop gpu=NVIDIA GeForce RTX 3060 Laptop GPU cpuThreads=20 reps=1
+group 1000: cpu1=0.004 cpuN2=0.537 gpu_e2e=2.653 gpu_kernel=0.780  [correct]
+========= ERROR SUMMARY: 0 errors

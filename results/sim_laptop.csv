@@ -1,0 +1,7 @@
+machine,config,mode,backend,graph_ms,rankings,avg_rank_us,max_rank_us,late_estimates,created,delivered,rejected,avg_delivery_ms,stats_ms,fps,wall_s
+laptop,city_40.json,cpu,cpu (20 threads),71.4817,15304,81,36777,0,11669,3013,5418,1369468,53.486,11.7335,60.3
+laptop,city_40.json,gpu,gpu (NVIDIA GeForce RTX 3060 Laptop GPU),76.3361,4179,3015,20511,0,11442,2979,5299,1345703,28.638,11.8879,60.2
+laptop,city_40.json,cpu,cpu (20 threads),67.7126,15776,109,2023,0,12029,3079,5695,1377502,57.063,,60.3
+laptop,city_40.json,gpu,gpu (NVIDIA GeForce RTX 3060 Laptop GPU),70.2717,4398,3473,8623,0,12029,3198,5576,1352679,41.183,,62.4
+laptop,city_60.json,cpu,cpu (20 threads),208.358,38010,272,24147,0,35452,5729,18765,1986933,60.49,,60.7
+laptop,city_60.json,gpu,gpu (NVIDIA GeForce RTX 3060 Laptop GPU),657.762,11730,2159,33214,0,35452,5730,18721,1988553,44.211,,63.3

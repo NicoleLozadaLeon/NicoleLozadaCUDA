@@ -1,0 +1,32 @@
+date: 2026-11-19T14:30:07-04:00
+== CPU
+CPU(s):                               20
+Model name:                           12th Gen Intel(R) Core(TM) i9-12900H
+Thread(s) per core:                   2
+Core(s) per socket:                   10
+Socket(s):                            1
+== memory
+               total        used        free      shared  buff/cache   available
+Mem:           7.6Gi       565Mi       6.6Gi       3.6Mi       606Mi       7.0Gi
+== OS
+Linux 6.6.87.2-microsoft-standard-WSL2 x86_64
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+== compiler
+g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+cmake version 4.2.3
+== GPU
+name, driver_version, clocks.max.sm [MHz], memory.total [MiB]
+NVIDIA GeForce RTX 3060 Laptop GPU, 610.91, 2100 MHz, 6144 MiB
+Cuda compilation tools, release 13.3, V13.3.73
+Build cuda_13.3.r13.3/compiler.38244171_0
+== Windows (PowerShell, the rubric's command; WSL2 shows a virtual 10x2 topology)
+Name                      : 12th Gen Intel(R) Core(TM) i9-12900H
+NumberOfCores             : 14
+NumberOfLogicalProcessors : 20
+TotalPhysicalMemoryGB: 15.7
+Microsoft Windows 11 Home 10.0.26300
+== build flags
+CMAKE_BUILD_TYPE:STRING=Release
+CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=86
+CMAKE_CUDA_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG

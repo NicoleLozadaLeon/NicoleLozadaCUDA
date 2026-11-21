@@ -7,10 +7,18 @@
 #include <utility>
 #include <vector>
 
+#include "Order.h"
 #include "SimClock.h"
 
 class EventLog {
 public:
+    struct Delivery {
+        int restaurant;
+        int deliveryNode;
+        long long createdAtMs;
+        long long deliveredAtMs;
+    };
+
     struct Summary {
         long long created = 0, delivered = 0, rejected = 0, pending = 0;
         long long reassigned = 0, breakdowns = 0;
@@ -26,7 +34,7 @@ public:
     void orderAssigned(const std::string& order, const std::string& courier);
     void pickupStarted(const std::string& order, const std::string& courier, const std::string& restaurant);
     void orderPickedUp(const std::string& order, const std::string& courier, const std::string& restaurant);
-    void orderDelivered(const std::string& order, const std::string& courier);
+    void orderDelivered(const Order& order, const std::string& courier);
     void orderRejected(const std::string& order, const std::string& reason);
     void courierBreakdown(const std::string& courier);
     void orderReassigned(const std::string& order, const std::string& from, const std::string& to);
@@ -34,6 +42,7 @@ public:
 
     Summary summary() const;
     std::string summaryJson() const;
+    std::vector<Delivery> deliveries() const;
 
 private:
     using Fields = std::vector<std::pair<std::string, std::string>>;
@@ -45,4 +54,5 @@ private:
     Summary counters_;
     std::unordered_map<std::string, long long> createdAt_;
     long long totalDeliveryMs_ = 0;
+    std::vector<Delivery> deliveries_;
 };

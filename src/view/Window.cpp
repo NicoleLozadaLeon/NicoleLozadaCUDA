@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,8 +30,14 @@ void text(cv::Mat& img, const std::string& s, cv::Point at, double size = 0.45) 
     cv::putText(img, s, at, cv::FONT_HERSHEY_SIMPLEX, size, cv::Scalar(20, 20, 20), 1, cv::LINE_AA);
 }
 }
-Window::Window(const Config& cfg) : cfg_(cfg) {
+Window::Window(const Config& cfg) : cfg_(cfg), grid_(cfg.map.bounds, 25.0) {
     cv::setNumThreads(0);
+    if (const char* v = std::getenv("EQ_OVERLAY")) {
+        const std::string name(v);
+        if (name == "demand") overlay_ = Overlay::Demand;
+        else if (name == "coverage") overlay_ = Overlay::Coverage;
+    }
+    if (const char* v = std::getenv("EQ_SNAPSHOT")) snapshot_ = v;
 
     const cv::Mat image = cv::imread(cfg.map.image, cv::IMREAD_COLOR);
     if (image.empty()) throw std::runtime_error("cannot read the map image: " + cfg.map.image);
@@ -60,6 +68,13 @@ cv::Point Window::nodePixel(const Graph& graph, int node) const {
 }
 bool Window::frame(const Simulation& sim) {
     cv::Mat img = background_.clone();
+    if (overlay_ != Overlay::None && frames_ % 30 == 0) requestOverlay(sim);
+    collectOverlay();
+    if (overlay_ != Overlay::None && !overlayImg_.empty()) {
+        cv::Mat blended;
+        cv::addWeighted(img, 0.45, overlayImg_, 0.55, 0.0, blended);
+        blended.copyTo(img, overlayMask_);
+    }
     const Graph& graph = sim.graph();
     const long long now = sim.clock().nowMs();
     std::vector<Courier::View> views;
@@ -100,10 +115,19 @@ bool Window::frame(const Simulation& sim) {
         cv::circle(img, p, 6, colorOf(states[i]), cv::FILLED, cv::LINE_AA);
         text(img, labels[i], p + cv::Point(9, 4), 0.33);
     }
+    cv::rectangle(img, cv::Rect(8, 140, 300, 22), cv::Scalar(250, 250, 250), cv::FILLED);
+    text(img, std::string("overlay: ") + overlayName() + "  (press o to change)", cv::Point(16, 156), 0.4);
     drawAttribution(img);
     cv::imshow(title_, img);
+    if (!snapshot_.empty() && frames_ % 150 == 149) cv::imwrite(snapshot_, img);
+    ++frames_;
     const int key = cv::waitKey(kFrameMs);
     if (key == 'q' || key == 27) return false;
+    if (key == 'o') {
+        overlay_ = static_cast<Overlay>((static_cast<int>(overlay_) + 1) % 3);
+        overlayImg_.release();
+        frames_ -= frames_ % 30;
+    }
     return cv::getWindowProperty(title_, cv::WND_PROP_VISIBLE) >= 1;
 }
 void Window::drawAttribution(cv::Mat& img) const {
@@ -122,4 +146,60 @@ void Window::drawAttribution(cv::Mat& img) const {
         text(img, "c", cv::Point(x + 2, y - 1), 0.4);
     }
     text(img, attribution, cv::Point(symbol ? x + 16 : x, y));
+}
+double Window::fps() const {
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
+    return s > 0.0 ? static_cast<double>(frames_) / s : 0.0;
+}
+const char* Window::overlayName() const {
+    switch (overlay_) {
+        case Overlay::Demand: return "demand heatmap";
+        case Overlay::Coverage: return "courier coverage (red = poorly covered)";
+        case Overlay::None: break;
+    }
+    return "none";
+}
+void Window::requestOverlay(const Simulation& sim) {
+    if (pending_.valid()) return;
+    const Graph& graph = sim.graph();
+    Grid g = grid_.empty();
+    if (overlay_ == Overlay::Coverage) {
+        for (const std::shared_ptr<Courier>& c : sim.fleet().couriers()) {
+            const Courier::View v = c->view();
+            grid_.add(g, graph.lat(v.legTo), graph.lon(v.legTo));
+        }
+        pending_ = sim.accel().coverage(std::move(g), 100);
+    } else {
+        const long long now = sim.clock().nowMs();
+        for (const EventLog::Delivery& d : sim.log().deliveries())
+            if (now - d.deliveredAtMs < 3600000) grid_.add(g, graph.lat(d.deliveryNode), graph.lon(d.deliveryNode));
+        for (int node : sim.book().deliveryNodes()) grid_.add(g, graph.lat(node), graph.lon(node));
+        pending_ = sim.accel().smooth(std::move(g), 2);
+    }
+    pendingFor_ = overlay_;
+}
+void Window::collectOverlay() {
+    if (!pending_.valid() || pending_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    Grid g;
+    try {
+        g = pending_.get();
+    } catch (const std::exception& e) {
+        std::cerr << "window: overlay failed: " << e.what() << "\n";
+        overlay_ = Overlay::None;
+        return;
+    }
+    if (pendingFor_ != overlay_ || g.v.empty()) return;
+    float peak = 0.0f;
+    for (float v : g.v) peak = std::max(peak, v);
+    cv::Mat values(g.h, g.w, CV_32F, g.v.data());
+    if (peak > 0.0f) values /= peak;
+    if (overlay_ == Overlay::Coverage) cv::pow(values, 0.25, values);
+    cv::Mat scaled;
+    values.convertTo(scaled, CV_8U, 255.0);
+    if (overlay_ == Overlay::Coverage) scaled = 255 - scaled;
+    cv::Mat colored;
+    cv::applyColorMap(scaled, colored, cv::COLORMAP_JET);
+    cv::resize(colored, overlayImg_, background_.size(), 0, 0, cv::INTER_LINEAR);
+    cv::Mat mask = overlay_ == Overlay::Coverage ? cv::Mat(scaled.size(), CV_8U, cv::Scalar(255)) : cv::Mat(scaled > 12);
+    cv::resize(mask, overlayMask_, background_.size(), 0, 0, cv::INTER_NEAREST);
 }

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.11)
+cmake_minimum_required(VERSION 3.18)
 project(delivery_sim LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -10,21 +10,51 @@ endif()
 
 option(ENABLE_TSAN "Instrument delivery_sim with ThreadSanitizer" OFF)
 option(ENABLE_ASAN "Instrument delivery_sim with AddressSanitizer + LeakSanitizier" OFF)
+option(USE_CUDA "Build the GPU versions with CUDA" OFF)
 
 if(ENABLE_TSAN AND ENABLE_ASAN)
   message(FATAL_ERROR "ENABLE_TSAN and ENABLE_ASAN cannot be used together")
+endif()
+if(USE_CUDA AND (ENABLE_TSAN OR ENABLE_ASAN))
+  message(FATAL_ERROR "the sanitizers are for the CPU build: use USE_CUDA=OFF with them")
 endif()
 find_package(Threads REQUIRED)
 find_package(OpenCV 4.1 REQUIRED COMPONENTS core imgproc imgcodecs highgui)
 
 file(GLOB_RECURSE SOURCES src/*.cpp)
+if(USE_CUDA)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 75 86)
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  file(GLOB_RECURSE CUDA_SOURCES src/*.cu)
+  list(APPEND SOURCES ${CUDA_SOURCES})
+endif()
+
 add_executable(delivery_sim ${SOURCES})
-target_include_directories(delivery_sim PRIVATE src/core src/shared src/actors src/parallel src/app src/view)
-target_compile_options(delivery_sim PRIVATE -Wall -Wextra)
+target_include_directories(delivery_sim PRIVATE src/core src/shared src/actors src/parallel src/app src/view
+                           src/accel src/gpu src/bench)
+target_compile_options(delivery_sim PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
+                       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+
+file(GLOB APP_CANDIDATES LIST_DIRECTORIES true ${CMAKE_SOURCE_DIR}/src/accel/* ${CMAKE_SOURCE_DIR}/src/gpu/*)
+foreach(dir ${APP_CANDIDATES})
+  if(IS_DIRECTORY ${dir})
+    target_include_directories(delivery_sim PRIVATE ${dir})
+  endif()
+endforeach()
 
 target_include_directories(delivery_sim SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/third_party)
 
 target_link_libraries(delivery_sim PRIVATE ${OpenCV_LIBS} Threads::Threads)
+if(USE_CUDA)
+  target_compile_definitions(delivery_sim PRIVATE EQ_USE_CUDA)
+  target_link_libraries(delivery_sim PRIVATE CUDA::cudart)
+endif()
+
 if(ENABLE_TSAN)
   target_compile_options(delivery_sim PRIVATE -fsanitize=thread -g -O1 -fno-omit-frame-pointer)
   target_compile_definitions(delivery_sim PRIVATE DELIVERY_SIM_TSAN)
