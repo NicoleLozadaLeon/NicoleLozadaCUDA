@@ -1302,3 +1302,143 @@ ncu --set full -k regex:"fleetBranchFree|fleetBranchy" -c 4 --csv --page details
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
 La prueba del orden (`probe_laptop_fleetsum_order.csv`) se hizo invirtiendo temporalmente el orden de los dos `addGpu` en `BenchFleetSummary.cpp` y corriendo `--size 1`, `--size 3` y `--size 4` con `--threads 4`.
+
+## 3.11 Aplicación 11 (2ª de 09_scan): cola de pedidos sin repartidor y su pico
+
+### Tarea y por qué es data-parallel
+- Cada pedido produce dos eventos: **+1** cuando se crea (empieza a esperar un repartidor) y **−1** cuando se asigna a un repartidor o se rechaza (deja de esperar).
+- En orden de tiempo, el **scan inclusivo** de esos eventos es cuántos pedidos están esperando después de cada evento. Su máximo es el **pico de la cola**, y el primer evento que lo alcanza dice **a qué hora** ocurrió.
+- **Problema de negocio.** En `city_60` (una hora simulada) se crearon 35 452 pedidos y se rechazaron 18 754 (53 %), porque no hubo repartidor dentro del plazo de aceptación de 10 minutos. La cola dice **cuándo y cuánto se acumulan** los pedidos sin repartidor: cuánta capacidad falta en el peor momento.
+- **Por qué es un scan.** Una suma acumulada parece serial (cada valor depende del anterior), pero se hace en paralelo en tres fases.
+- **Base en el curso.**
+  - `ec2/09_scan/bikeshare_rentals_in_progress.cu`: sacar la bici (+1) y devolverla (−1) son aquí crear el pedido (+1) y asignarlo o rechazarlo (−1). Mismo scan inclusivo, `atomicMax` para el pico, `atomicMin` para el primer evento y los mismos controles.
+  - `09_task_parallelism/example_54.cpp` y `exercise_9_2.cpp`: el scan paralelo de tres fases en la CPU.
+- Referencia en CPU: `cpuOne`, una suma acumulada.
+
+### Dónde se usa en el programa
+- El resumen final: el pico de la cola, a qué hora ocurrió y cuántos pedidos quedan esperando al terminar.
+- **Solo lee el `events.log` que el programa ya escribe** (`--log`, por defecto `events.log`; cada línea se vacía a disco, así que queda completo al cerrar). Usa tres tipos de líneas: `orderCreated`, `orderAssigned` y `orderRejected`. No hace falta ningún atributo ni método nuevo.
+- Con el capítulo 8 corre dentro de la simulación con una llamada después de `sim.stop()` en `main`, con `args.logPath`: `loadLog` → `gpuScan` (o `cpuMulti`) → `summarize`. En el benchmark no se modifica nada del programa.
+- No depende de ninguna otra aplicación.
+
+### Diseño
+- **Datos.** `deltas[i]` (+1 o −1) y `timesMs[i]`, que solo se usa en la CPU para decir la hora del pico y no se sube a la GPU.
+- **Scan por secciones (`backlogScanSections`).** 256 threads × 8 eventos = **2048 eventos por bloque**: carga coalesced, scan de la racha de cada thread, Kogge–Stone sobre los totales de las rachas y suma del total de la izquierda. Usa 9 KB de shared memory por bloque.
+- **Cualquier largo.** Scan jerárquico: se escanean las sumas de bloque (recursivo) y `backlogAddOffsets` las suma de vuelta.
+- **Pico.** `backlogMaxValue`: `atomicMax` en shared memory dentro del bloque y un `atomicMax` global por bloque.
+- **Primer evento.** `backlogFirstIndex`: `atomicMin` del índice, solo para los elementos iguales al pico. El valor del pico se queda en la GPU y el kernel lo lee, así el host no espera entre kernels.
+- **CPU N threads (ejercicio 9.2).** Fase 1: cada thread escanea su trozo y guarda su total y su pico local. Fase 2 (tiny, secuencial): scan de los totales y pico global = el mejor pico local más el offset de su trozo (si empatan, el trozo más temprano). Fase 3: cada thread suma el offset de su trozo.
+- **Salida.** Se baja la curva completa (4 B por evento) además del pico, para que el panel pueda dibujarla.
+
+### Correctitud
+- Son enteros: la GPU y la CPU con N threads deben dar **exactamente** lo mismo que `cpuOne`: cada valor de la curva, el valor del pico y el primer evento del pico. Sin tolerancia.
+- **Controles del curso, adaptados.** La curva nunca es negativa y **termina donde dice una suma independiente** de los eventos (una reducción aparte). En el curso termina en 0 porque cada bici vuelve; aquí quedan pedidos abiertos al final.
+- **Empates.** El curso pone el +1 antes que el −1 a igual hora. En el log real las líneas ya están en orden causal (0 retrocesos de tiempo y 9 923 pares con el mismo `t` en `city_60`), así que no hace falta ordenar.
+- **Con datos reales** (`results/probe_laptop_backlog_citylog.csv`, el log de `city_60`):
+  - 65 936 eventos. Pico de **5 002** pedidos esperando a los 1 145 279 ms (19 min 5 s).
+  - La curva termina en **4 968**, que es 35 452 − 11 730 − 18 754. Coincide con un cálculo independiente en Python.
+  - Con el brief (256 eventos): pico de 15 a los 3 228 884 ms, termina en 10.
+- compute-sanitizer (`results/sanitizer_laptop_backlog.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Racecheck revisa el Kogge–Stone en shared memory y sus barreras.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms.
+Fuente: `results/bench_laptop_backlog.csv`, tabla de `analysis/report.ipynb`.
+Entradas: un día sintético de 24 h con semilla fija y el perfil de horas del curso (dos horas pico). Como en el log de `city_60`, el 38.5 % de los pedidos se asigna a los pocos segundos y el resto se rechaza justo a los 10 minutos.
+
+| size (eventos) | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|
+| 998 | 0.002 | 0.002 (CPU 1) | 0.117 | 1.652 | 0.02 | 0.001 | yes |
+| 9 994 | 0.013 | 0.013 (CPU 1) | 0.050 | 1.429 | 0.26 | 0.009 | yes |
+| 99 944 | 0.115 | 0.115 (CPU 1) | 0.178 | 1.789 | 0.65 | 0.064 | yes |
+| 999 355 | 1.330 | 1.153 (N=2) | 0.199 | 5.194 | 5.8 | 0.22 | yes |
+| 7 994 880 | 9.763 | 6.433 (N=4) | 1.117 | 16.028 | 5.8 | 0.40 | yes |
+
+- **Tamaño del problema** = eventos: de 998 a casi 8 millones (el curso usa 8 M en la GPU), casi 4 órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+- **Con el log real** de `city_60` (65 936 eventos, una hora simulada): CPU 1 thread **0.077 ms**, GPU kernel 0.311 ms y GPU end to end 1.830 ms.
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 7.1 % (998), 3.5 %, 10.0 %, 3.8 %, 7.0 % (8 M). **Más del 90 % es copiar, reservar memoria y lanzar los kernels.** Con 8 M eventos se suben 32 MB y se baja la curva de 32 MB.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (7 994 880 eventos, mediana).** 1 thread: 9.76 ms · 2: 8.72 · 4: 6.43 · 8: 6.96 · 14: 8.68 · 20: 9.97 ms.
+El mejor es **4 threads (1.5×)**. Con 20 threads es peor que con 1.
+- **Por qué el paralelo gana tan poco.** El scan de tres fases hace el doble de trabajo que el secuencial, así que necesita al menos 2 threads para empatar (pregunta 3 del ejercicio 9.2), y con 4 threads la RAM ya está saturada.
+- **Cuándo gana el scan paralelo de CPU** (pregunta 4 del ejercicio 9.2): entre 10⁵ y 10⁶ eventos. Con 99 944 gana 1 thread (0.115 contra 0.395 ms con 2) y con 999 355 ya gana el paralelo (1.153 contra 1.330 ms).
+
+![thread sweep](../results/thread_sweep.png)
+
+### Profiler (Nsight Compute, 999 355 eventos, grid 488, block 256)
+| Métrica | scan por secciones | sumar offsets | máximo | primer evento |
+|---|---|---|---|---|
+| Duration | 37.8 µs | 32.4 µs | 21.0 µs | 20.6 µs |
+| Theoretical / achieved occupancy | 100 % / 88.3 % | 100 % / 98.6 % | 100 % / ~100 % | 100 % / ~100 % |
+| Block limit: warps / registers / shared mem | 6 / 8 / 6 bloques | 6 / 16 / 8 | 6 / 6 / 14 | 6 / 16 / 8 |
+| Registers per thread · shared por bloque | 27 · 9 KB | 16 · 0 | 40 · 4 B | 16 · 0 |
+| Waves per SM | 2.71 | 2.71 | 5.69 | 5.69 |
+| Compute (SM) throughput | 43.2 % | 11.8 % | 23.3 % | 18.3 % |
+| DRAM throughput | 70.2 % | 81.6 % | 78.0 % | 79.8 % |
+| L1/TEX · L2 throughput | 80.3 % · 20.5 % | 24.9 % · 23.8 % | 18.5 % · 18.7 % | 17.4 % · 18.9 % |
+| Avg. active threads per warp | 31.9 | 32.0 | 31.8 | 32.0 |
+| Branch efficiency · divergent branches | 87.5 % · 4.1 | 100 % · 0.01 | 100 % · 0.02 | 100 % · 0.02 |
+
+- **Occupancy (método de la sesión 12).** El scan usa 9 216 B de shared memory por bloque (6 bloques por SM), 27 registros por thread (8 bloques) y 8 warps por bloque (6 bloques): **tres límites empatan en 6 bloques**, así que la teórica es 100 %. La alcanzada es 88 %.
+- ncu muestra 104 % y 100.1 % de achieved occupancy en el máximo y el primer evento: es un artefacto de cómo promedia, y lo reporto como «~100 %».
+- **Memory-bound.** La DRAM trabaja al 70–82 % en los cuatro kernels. El scan además tiene L1/TEX al 80 % y el cómputo al 43 %, por el tráfico de shared memory del Kogge–Stone.
+- **Divergencia baja.** El scan tiene 87.5 % de branch efficiency y 4 ramas divergentes (la última sección, que queda a medias, y el `if (t >= stride)` del Kogge–Stone). Los otros tres kernels casi no tienen.
+- **Tráfico de memoria por evento: 24 B.** Scan 8 B (leer y escribir), offsets 8 B, máximo 4 B y primer evento 4 B. Es el «unas 4n lecturas y escrituras, cuando el mínimo es 2n» que explica el README del curso para el scan jerárquico.
+
+### Roofline
+- Conteo por evento: 3 sumas del scan (una por fase), 1 comparación del máximo y 1 del primer evento: **5 operaciones enteras**. Bytes: **24 B**.
+- Intensidad aritmética: **0.21 op/byte**. Ridge point ≈ 48: muy a la izquierda, **memory-bound**.
+- Rendimiento alcanzado con 8 M eventos, tiempo por eventos (1.117 ms): **3.6 × 10¹⁰ op/s**. El techo de memoria en 0.21 op/byte es 0.2083 × 336 GB/s = 7.0 × 10¹⁰ op/s: llega al **51 %**.
+- Con Nsight Compute (los cuatro kernels suman unos 112 µs con 10⁶ eventos): 4.5 × 10¹⁰ op/s, el **64 %**.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** Cada thread del scan toma 8 eventos, así que hay `N / 2048` bloques: 1 con 998 eventos, 5 con 9 994, 49 con 99 944, 488 con un millón y 3 904 con 8 M. Caben 6 bloques por SM, 180 a la vez: con un millón son 2.7 waves y con 8 M, 21.7. Por debajo de 10⁵ eventos la GPU está casi vacía.
+- **Overheads.** El kernel es entre el 3.5 y el 10 % del end to end. Cada llamada sube 4 B por evento, baja 4 B por evento y lanza de 5 a 6 kernels (scan, niveles, offsets, inicio, máximo y primer evento).
+- **¿Los datos pueden quedarse en la GPU?** En el programa, no: los eventos salen del log y el análisis se hace **una vez**, al cerrar. Si la curva se quedara en la GPU, solo volverían 8 bytes (pico y primer evento). No se midió.
+- **Memory-bound.** Ver el profiler: los cuatro kernels están limitados por la DRAM.
+- **Optimización antes/después.** No se midió otra variante de scan. El curso compara Kogge–Stone, Brent–Kung y el coarsened; aquí uso el coarsened porque es el que crea menos sumas de bloque.
+- **Contención y sincronización.** Los atomics están solo en el pico: `atomicMax` en shared memory (privatizado por bloque, como el histograma de la aplicación 4) y uno global por bloque. `atomicMin` solo lo hacen los elementos iguales al pico, que son pocos. El Kogge–Stone usa dos barreras por paso, y entre niveles del scan el orden de los launches en el mismo stream hace de barrera global.
+- **Correctitud en paralelo.** Enteros y `atomicMin` del índice: el primer evento del pico no depende del orden de los threads.
+- **Check-then-act.** El análisis lee el log **cuando la simulación ya paró**: no hay nadie escribiendo, así que no hay ventana entre leer y decidir. Es solo informativo.
+
+### Veredicto
+- **Crossover end to end: nunca.** La GPU no le gana a la mejor CPU en ningún tamaño (máximo 0.40×).
+- **El kernel gana desde un millón de eventos: 5.8×.** Pero el kernel es menos del 10 % del tiempo total.
+- **Escala del brief (256 eventos):** menos de 1 µs. **CPU.**
+- **Ciudad (`city_60`, una hora simulada, 65 936 eventos):** la CPU con 1 thread tarda 0.077 ms y la GPU 1.83 ms end to end (0.04×). **CPU.** Un día entero serían unos 1.6 millones de eventos, cerca de la fila de un millón de la tabla: el kernel ganaría unas 5 veces, pero el end to end seguiría perdiendo (0.2×).
+- **Decisión: mantener la CPU** (`cpuOne`): analizar el log al cerrar tarda menos de 0.1 ms con una hora de `city_60`.
+- **Lo que sí aporta a la operación:** en `city_60` la cola llega a **5 002 pedidos esperando a los 19 minutos** y termina en **4 968**, casi igual que el pico. La capacidad no alcanza desde los primeros 20 minutos, y eso es consistente con el 53 % de pedidos rechazados.
+
+### Threats to validity
+- **Kernels muy cortos.** Con 998 a 99 944 eventos el kernel dura 50–180 µs, con dispersión (con 998, de 22 a 304 µs).
+- **Entrada sintética.** Un día de 24 h con el perfil de horas del curso. El log real de `city_60` dura una hora y llega a un ritmo distinto. Las proporciones de asignados (38.5 %) y rechazados vienen de ese log.
+- **Eventos contra ncu.** Con un millón de eventos el kernel mide 199 µs por eventos y unos 112 µs sumando los cuatro kernels en ncu: el tiempo por eventos incluye el launch de 5 a 6 kernels.
+- **Una sola versión de GPU.** En las aplicaciones 9 y 10 medí que la primera versión de GPU que corre paga unos 0.1–0.2 ms extra en el end to end. Aquí no hay una segunda versión para invertir el orden, así que el end to end de los tamaños chicos puede ser pesimista.
+- **Dispersión de la CPU multithread.** Con 8 M eventos y 4 threads: de 5.6 a 7.2 ms. Por eso se reporta la mediana.
+- **Leer y convertir el log es trabajo de CPU fuera del tiempo medido,** igual que el curso arma sus eventos antes de medir.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_backlog.csv --machine laptop --threads 1,2,4,8,14,20 --apps backlog
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps backlog
+done
+ncu --set full -k regex:"backlog(Scan|Add|Max|First)" -c 8 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 3 --reps 1 --threads 2 --apps backlog
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
+La prueba con datos reales (`probe_laptop_backlog_citylog.csv`) usa el log de una corrida de `city_60`:
+```bash
+python3 tools/make_city_config.py 60 2000 40 100 3600 /tmp/city_60.json
+./build/delivery_sim /tmp/city_60.json --log /tmp/ov_city_60.log --headless
+EQ_BACKLOG_LOG=/tmp/ov_city_60.log ./build-gpu/delivery_sim config/equipetrol.json --bench results/probe_laptop_backlog_citylog.csv --machine laptop --threads 1,2,4,8,14,20 --apps backlog
+```

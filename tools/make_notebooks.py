@@ -101,6 +101,7 @@ REPORT = [
              "    if app == 'near': return 7 * n, 8 * n / 128\n"
              "    if app == 'foodwait': return 4 * n, 13 * n\n"
              "    if app == 'fleetsum': return 20 * n, 12 * n\n"
+             "    if app == 'backlog': return 5 * n, 24 * n\n"
              "    return np.nan, np.nan\n"
              "pts = []\n"
              "for app in APPS:\n"
