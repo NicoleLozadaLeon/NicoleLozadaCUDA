@@ -1442,3 +1442,153 @@ python3 tools/make_city_config.py 60 2000 40 100 3600 /tmp/city_60.json
 ./build/delivery_sim /tmp/city_60.json --log /tmp/ov_city_60.log --headless
 EQ_BACKLOG_LOG=/tmp/ov_city_60.log ./build-gpu/delivery_sim config/equipetrol.json --bench results/probe_laptop_backlog_citylog.csv --machine laptop --threads 1,2,4,8,14,20 --apps backlog
 ```
+
+## 3.12 Aplicación 12 (2ª de 05_conv): zonas con más pedidos pendientes y su repartidor más cercano
+
+### Tarea y por qué es data-parallel
+- Los pedidos sin resolver caen en celdas del mapa (en `city_60` quedan 4 968 al terminar la hora simulada). Se cuentan por celda. Con 5 000 pedidos sobre miles de celdas el conteo es muy ralo: casi todo 0 y un máximo de 7 pedidos en una celda.
+- El conteo se suaviza con un **filtro gaussiano de 13 × 13, σ = 3 celdas** (169 pesos): cada celda pasa a ser el promedio ponderado de sus 169 vecinas. Sale un mapa continuo de demanda.
+- Sobre ese mapa se sacan las **5 zonas más fuertes** (separadas por más de 15 celdas), cada una con su **repartidor más cercano**. Si ese repartidor está a más de 500 m, la zona queda **sin cobertura**.
+- **Problema de negocio.** Dónde mandar o reubicar repartidores: zonas donde se acumula demanda y no hay nadie cerca.
+- **Por qué es data-parallel.** El conteo es un thread por pedido. El suavizado es una convolución: cada celda de salida se calcula sola y la entrada solo se lee.
+- **Base en el curso.**
+  - `ec2/05_conv/bikeshare_demand_heatmap.cu`: el filtro de 13 × 13 con σ = 3 celdas, los 169 pesos en `__constant__`, el tile de 32 × 32 en shared memory (entran 32 × 32 y salen 20 × 20), las zonas más fuertes con separación de 15 celdas y la regla «new station here» a más de 500 m, que aquí es «sin cobertura».
+  - `ec2/07_histogram`: contar con `atomicAdd`.
+- **Datos.** Lo que el programa ya da: los destinos de los pedidos pendientes (`OrderBook::deliveryNodes()`), las posiciones de los repartidores (`Courier::view()`) y `MapGrid`. No hace falta ningún atributo ni método nuevo.
+- Referencia en CPU: `cpuOne` (conteo y cuatro bucles de suavizado).
+
+### Dónde se usa en el programa
+- El resumen final: una lista con las 5 zonas con más demanda pendiente, su repartidor más cercano y si están sin cobertura.
+- Solo **lee**. `Simulation::book().deliveryNodes()` da los pedidos pendientes y `Graph::lat/lon` + `MapGrid::cellOf` los pasan a celdas. `Simulation::fleet().couriers()` + `Courier::view()` da dónde está cada repartidor. `Simulation::stop()` cierra el `OrderBook` pero no lo vacía: los pedidos pendientes siguen ahí.
+- Con el capítulo 8 corre dentro de la simulación con una llamada después de `sim.stop()` en `main`: conteo y suavizado (`cpuMulti`, o `gpuDirect` con `EQ_GPU=1`) y `rank`. En el benchmark no se modifica nada del programa.
+- No depende de ninguna otra aplicación. Solo usa `MapGrid.h`, el encabezado común de `accel`.
+
+### Diseño
+- **Datos.** `cells[i]` = número de celda (`y · w + x`) de cada pedido, 4 B. La conversión de lat/lon a celda la hace `MapGrid::cellOf` en la CPU, con la misma llamada que usa el programa, y es igual para todas las versiones: no se mide.
+- **Conteo (`countOrders`).** Un thread por pedido, 256 por bloque. `atomicAdd` de `1.0f` en su celda. Sumar `1.0f` es exacto y no depende del orden.
+- **Suavizado con tile (`smoothTiled`).** Block de **32 × 32 = 1 024 threads**. Cada bloque carga a shared memory (4 KB) un tile de 32 × 32 celdas, con un halo de 6 celdas por lado. Solo los **20 × 20 threads del centro** calculan (400 de 1 024, el 39 %): cada uno hace 169 multiplicaciones y sumas leyendo de shared. Los 12 threads de cada borde solo cargan. Los 169 pesos están en `__constant__`: los 32 threads de un warp leen el mismo peso en cada paso (broadcast). Bucles desenrollados y `__launch_bounds__(1024)`.
+- **Suavizado directo (`smoothDirect`).** Block de 16 × 16, todos los threads escriben y leen la grilla de memoria global (la L1 reparte los datos). Es la versión contra la que se compara el tile.
+- **Bordes.** Las celdas fuera del mapa valen 0 en el tile y se saltan en la CPU y en la directa: la misma suma.
+- **CPU N threads.** El conteo es secuencial (5 000 pedidos). El suavizado reparte las filas con `parallelFor`.
+- **Zonas (`rank`).** En la CPU, igual para todas las versiones: 5 veces «máximo de la grilla, y se apaga un cuadrado de 15 celdas alrededor». A igual valor gana la celda menor. No se mide.
+
+### Correctitud
+- Son números `float`. El conteo es **exacto** (enteros pequeños). El suavizado difiere en los últimos bits por la FMA de la GPU. Tolerancia: error relativo al máximo del mapa **≤ 10⁻⁵** (`maxRelativeError`). El orden de la suma es el mismo en CPU y GPU; las celdas de afuera del mapa suman ceros que no cambian el resultado.
+- La CPU con N threads da el mismo resultado que `cpuOne` bit a bit (probado con 2, 7 y 20 threads en los 5 tamaños con un test chico aparte, que no se sube).
+- `rank`, con el mismo test aparte: el orden es decreciente, dos zonas nunca están a menos de 16 celdas, el desempate es la celda menor, sin repartidores todas las zonas quedan sin cobertura, sin demanda la lista sale vacía, y un pedido fuera de la grilla se ignora.
+- compute-sanitizer con 10 m (`results/sanitizer_laptop_hotspots.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Racecheck revisa la carga del tile y su barrera; memcheck, los bordes y los accesos al halo.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV, en las dos versiones de GPU.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms.
+Fuente: `results/bench_laptop_hotspots.csv`, tabla de `analysis/report.ipynb`.
+Entradas: 5 000 pedidos pendientes sintéticos con semilla fija, los mismos en los cinco tamaños. El 60 % cae alrededor de 6 centros de demanda (σ = 150 m) y el 40 % se reparte parejo sobre el mapa. Cambia solo el tamaño de la celda, de 20 m a 1 m.
+
+**GPU con tile de 32 × 32 (`gpu`)**
+
+| size (celda, grilla) | celdas | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|---|
+| 20 m, 95×136 | 1.3 × 10⁴ | 2.875 | 1.131 (N=4) | 0.049 | 1.465 | 23 | 0.77 | yes |
+| 10 m, 190×271 | 5.1 × 10⁴ | 7.532 | 2.274 (N=4) | 0.061 | 1.473 | 37 | 1.54 | yes |
+| 5 m, 380×542 | 2.1 × 10⁵ | 28.741 | 7.388 (N=14) | 0.157 | 1.580 | 47 | 4.67 | yes |
+| 2 m, 949×1354 | 1.3 × 10⁶ | 175.323 | 36.404 (N=20) | 0.836 | 7.210 | 44 | 5.05 | yes |
+| 1 m, 1898×2707 | 5.1 × 10⁶ | 715.402 | 119.557 (N=20) | 2.546 | 21.628 | 47 | 5.53 | yes |
+
+**GPU directa de 16 × 16 (`gpu_direct`) contra el tile**
+
+| celda | kernel tile | kernel directa | tile / directa | e2e tile | e2e directa | speedup e2e directa |
+|---|---|---|---|---|---|---|
+| 20 m | 0.049 | 0.042 | 1.17 | 1.465 | 1.505 | 0.75 |
+| 10 m | 0.061 | 0.055 | 1.11 | 1.473 | 1.248 | 1.82 |
+| 5 m | 0.157 | 0.102 | 1.54 | 1.580 | 1.542 | 4.79 |
+| 2 m | 0.836 | 0.475 | 1.76 | 7.210 | 7.053 | 5.16 |
+| 1 m | 2.546 | 1.675 | 1.52 | 21.628 | 20.454 | 5.85 |
+
+- **Tamaño del problema** = celdas: de 1.3 × 10⁴ a 5.1 × 10⁶, más de dos órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+- **Dispersión con 1 m (mínimo – máximo).** CPU 1: 696 – 747 ms. CPU con 20 threads: 110 – 161 ms. End to end del tile: 20.2 – 30.2 ms; de la directa: 18.7 – 37.7 ms. El kernel es estable: 2.31 – 2.90 ms el tile y 1.45 – 4.26 ms la directa.
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel (tile): 3.3 % (20 m), 4.1 %, 9.9 %, 11.6 %, 11.8 % (1 m). **Entre el 88 % y el 97 % es reservar memoria, copiar y lanzar.** Se suben solo 20 KB (los 5 000 pedidos) y se baja el mapa: de 52 KB (20 m) a 20.5 MB (1 m).
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (1 m, mediana).** 1 thread: 715.4 ms · 2: 379.2 · 4: 207.0 · 8: 168.3 · 14: 140.5 · 20: 119.6 ms.
+Speedup de **6.0×** con 20 threads. Casi lineal hasta 4 (cores P, 3.5×); después crece menos porque los cores E son más lentos. Con 20 m, 20 threads no ayudan (2.88 ms contra 2.88 con 1 thread): el mejor es 4 (1.13 ms).
+
+![thread sweep](../results/thread_sweep.png)
+
+### Profiler (Nsight Compute, 1 m 1898×2707)
+| Métrica | `smoothTiled` | `smoothDirect` | `countOrders` |
+|---|---|---|---|
+| Grid · block | 95×136 · 32×32 | 119×170 · 16×16 | 20 · 256 |
+| Elapsed cycles | 3.44 M | 1.91 M | 4 748 |
+| Executed instructions (warp) | 99.8 M | 151.0 M | 2 687 |
+| IPC (active) · issue slots busy | 0.99 · 24.2 % | 2.64 · 65.8 % | 0.07 · 0.7 % |
+| Theoretical / achieved occupancy | 66.7 % / 43.9 % | 100 % / 87.4 % | 100 % / 15.2 % |
+| Block limit: warps / registers / shared mem | 1 / 2 / 1 bloque | 6 / 10 / 8 bloques | 6 / 16 / 8 bloques |
+| Registers per thread · shared por bloque | 26 · 4 KB | 22 · 0 B | 16 · 0 B |
+| Waves per SM | 430.7 | 112.4 | 0.11 |
+| Compute (SM) throughput | 88.1 % | 96.5 % | 1.4 % |
+| Memory throughput | 88.1 % | 96.5 % | 32.5 % |
+| DRAM throughput | 6.0 % | 4.7 % | 32.5 % |
+| L1/TEX throughput | 90.1 % | 98.1 % | 8.6 % |
+| L1/TEX · L2 hit rate | 0.4 % · 76.9 % | 98.0 % · 79.9 % | 0 % · 12.9 % |
+| FMA pipe activa | 11.5 % | 16.1 % | 0.5 % |
+| Avg. active threads per warp | 21.4 de 32 | 31.9 de 32 | 31.9 de 32 |
+| Branch efficiency · divergent branches | 97.9 % · 72.1 | 99.97 % · 5.95 | 0 % · 0 |
+
+- **Ncu no fijó el reloj**: la frecuencia del SM fue 1.42 GHz con el tile y 0.61 GHz con la directa. Por eso los **ciclos** comparan mejor que los tiempos: la directa usa 1.91 M ciclos y el tile 3.44 M (1.8 veces más).
+- **Occupancy.** El tile usa 1 024 threads = 32 warps: caben 32 de los 48 que admite un SM, o sea **un solo bloque por SM** (límite de warps 1, y de shared memory 1 con la configuración de 8 KB). Teórica 66.7 %, alcanzada 43.9 %. La directa usa 8 warps por bloque y caben 6: 100 % y 87.4 %.
+- **Warps y divergencia.** En el tile solo escriben 20 × 20 de 32 × 32 threads, así que cada warp tiene **21.4 de 32 threads activos** y 72 ramas divergentes. En la directa son 31.9 de 32 y 6 ramas, de los bordes del mapa.
+- **Qué limita.** No es la DRAM (6 % y 4.7 %) ni la FMA (11.5 % y 16.1 %): es la **tubería de carga de L1 y shared memory** (88 % y 96 %). Cada FMA necesita una carga y son 169 por celda.
+- **El tile ejecuta menos instrucciones y tarda más.** 99.8 M contra 151 M, de las cuales 43.5 M son lecturas de shared. Pero con un solo bloque por SM y una barrera, mientras los warps esperan la carga del tile no hay otro bloque que llene el SM: 24 % de issue slots contra 66 %.
+- **`countOrders`.** 3.4 µs con 20 bloques para 30 SMs. Con 5 000 pedidos no pesa.
+
+### Roofline
+- Conteo por celda: 169 multiplicaciones y 169 sumas (**338 operaciones**). Bytes del tile: por cada 20 × 20 salidas se lee un tile de 32 × 32 (4 · 1024 / 400 = 10.24 B por celda) y se escribe 1 vez (4 B): **14.24 B**.
+- Intensidad aritmética: **23.7 op/byte** (el curso da 23.7). Rendimiento alcanzado con 1 m, por eventos (2.546 ms): **6.8 × 10¹¹ op/s**. La directa llega a 1.0 × 10¹² op/s.
+- Ridge point ≈ 48 op/byte. Con 23.7 queda a la izquierda: el techo de memoria es 23.7 × 336 GB/s = 8.0 × 10¹² op/s. El tile llega al **8.6 %** de ese techo.
+- **Ese techo no es el que limita.** La DRAM trabaja al 6 %. Los 169 accesos por celda los sirve shared memory (el tile) o la L1 (la directa): el límite real es esa tubería, al 88–96 %. El roofline de DRAM no lo ve.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** El tile cubre la grilla con bloques de 20 × 20 salidas: 35 con 20 m, 140, 532, 3 264 y 12 920 con 1 m. Entra un bloque por SM, o sea 30 a la vez: con 20 m son 1.2 waves y la GPU no se llena; con 1 m son 430 waves.
+- **Overheads.** El kernel es entre el 3 y el 12 % del end to end. Lo que se paga es reservar memoria en la GPU, bajar el mapa y lanzar los tres kernels.
+- **¿Los datos pueden quedarse en la GPU?** El mapa se baja porque `rank` y el panel lo leen en la CPU. Los pedidos pendientes cambian con cada consulta (20 KB). En el programa, no.
+- **Memory-bound o compute-bound.** Ninguno puro: limita la carga de L1/shared (ver profiler y roofline).
+- **Optimización antes/después.** La directa es el antes y el tile el después. Occupancy alcanzada: 87.4 % → 43.9 %. Threads activos por warp: 31.9 → 21.4. Branch efficiency: 99.97 % → 97.9 %. Ciclos: 1.91 M → 3.44 M. Con un filtro de 13 × 13 la L1 ya da el reuso (98 % de hits). El tile agrega la copia a shared, el halo (1 024 cargas para 400 salidas) y una barrera, y ocupa un solo bloque por SM.
+- **Contención y sincronización.** `countOrders`: `atomicAdd` sobre 5 000 pedidos, con un máximo de 7 por celda con 20 m, 4 con 10 m y 5 m, y 2 con 2 m y 1 m. Dura 3.4 µs. El suavizado tiene una barrera por bloque y ningún atomic.
+- **Correctitud en paralelo.** Sumar `1.0f` es exacto en cualquier orden. En el suavizado ningún thread depende de otro; la única diferencia con la CPU es el redondeo de FMA, dentro de la tolerancia.
+
+### Veredicto
+- **Crossover end to end: unas 5 × 10⁴ celdas (10 m).** Ahí la GPU gana 1.54× (tile) y 1.82× (directa). Con 5 m gana 4.7×, con 2 m 5.1× y con 1 m **5.5×** (tile) y 5.9× (directa).
+- **El kernel gana desde la grilla más chica: 23–47× el tile y 27–77× la directa.**
+- **Tile contra directa.** La directa es 1.1–1.8 veces más rápida en el kernel. En el end to end quedan casi iguales porque pesa copiar y reservar memoria.
+- **Escala del brief (133 pedidos creados):** pocas celdas y casi sin pedidos. **CPU.**
+- **Ciudad (la ventana usa celdas de 25 m: 76 × 109 ≈ 8 300 celdas):** está por debajo de la grilla más chica medida. La CPU tarda 1–2 ms con 1 thread y menos de 1 ms con 4; la GPU, unos 1.5 ms end to end. **CPU.**
+- **Decisión.** En el programa tal como está, la CPU. La GPU conviene desde celdas de unos 10 m (más de 5 × 10⁴ celdas), y ahí la variante directa. El tile queda como el diseño del curso medido y explicado.
+
+### Threats to validity
+- **Entrada sintética.** 5 000 pedidos (como los 4 968 sin resolver de `city_60`), el 60 % en 6 centros y el resto parejo. Los pedidos reales caen en nodos del grafo: varios pedidos por celda, más contención del `atomicAdd`. Con 5 000 atomics sigue costando microsegundos.
+- **Celdas finas.** Con celdas de 1–2 m el filtro (σ = 3 celdas = 3–6 m) casi no junta pedidos. Esos tamaños miden la escala de la GPU; el mapa útil es el de 20–25 m.
+- **La CPU hace el mismo algoritmo** (169 pesos por celda, como el curso). Un filtro gaussiano es separable: dos pasadas de 13 pesos son 26 en vez de 169, 6.5 veces menos operaciones. No se midió. También achicaría el trabajo de la GPU y la ventaja podría bajar.
+- **Calentamiento de la GPU.** La laptop baja la GPU a su estado de reposo mientras la CPU corre las variantes largas (el muestreo con `nvidia-smi` mostró 210–375 MHz). En una corrida de 10 repeticiones con el sweep completo, los kernels de 1 m medían 18.1 ms (tile) y 10.6 ms (directa) en vez de 2.5 y 1.4–1.7 con la GPU caliente. Por eso el benchmark (solo `BenchHotspots.cpp`) mantiene la GPU ocupada 400 ms antes de cada medición y corre antes una vez la misma variante sin medir: el tiempo que va al CSV es el de la segunda corrida. Vale para las dos variantes de GPU y no para la CPU. Una sola llamada al final de la simulación arranca con la GPU en reposo, y su primer kernel sería más lento.
+- **Dispersión del end to end.** Con 1 m va de 18.7 a 37.7 ms. En corridas anteriores del mismo tamaño, con los mismos kernels, fue de 9 ms: unos 10 ms dependen del estado de la memoria del host en WSL2 (reservar y tocar 20 MB), no del kernel. Por eso se reporta la mediana y el rango.
+- **Ncu.** No fijó el reloj (0.61 GHz en la directa): se compara en ciclos. Se perfiló solo 1 m.
+- **`rank` no se mide.** Son 5 búsquedas del máximo en la CPU, igual para todas las versiones.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_hotspots.csv --machine laptop --threads 1,2,4,8,14,20 --apps hotspots
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 1 --reps 1 --threads 2 --apps hotspots
+done
+ncu --set full -k regex:"smooth|countOrders" -c 6 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 4 --reps 1 --threads 2 --apps hotspots
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
+`results/ncu_hotspots_noclock_laptop.csv` es la misma captura con `--clock-control none --page raw` y las métricas `gpu__time_duration`, `smsp__cycles_elapsed.avg.per_second`, `sm__pipe_fma_cycles_active` y `smsp__inst_executed_op_shared_ld`.
