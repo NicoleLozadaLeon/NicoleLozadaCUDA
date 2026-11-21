@@ -1156,3 +1156,149 @@ ncu --set full -k regex:"foodWaitSoA|foodWaitAoS" -c 4 --csv --page details ./bu
 cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
 ```
 La prueba del orden (`probe_laptop_foodwait_order.csv`) se hizo invirtiendo temporalmente el orden de los dos `addGpu` en `BenchFoodWait.cpp` y corriendo `--size 0`, `--size 1` y `--size 3` con `--threads 4`.
+
+## 3.10 Aplicación 10 (2ª de 08_reduction): resumen de la flota en una pasada
+
+### Tarea y por qué es data-parallel
+- Se quiere un **resumen del estado de la flota** en un instante: cuántos repartidores hay en cada estado (`Idle`, `ToRestaurant`, `Carrying`, `Broken`), cuántos pueden tomar otro pedido, cuántos pedidos hay en todas las bolsas y cuántos ya se recogieron.
+- Además, dos argmax: **quién tiene la bolsa más llena** (a igual valor gana el índice menor) y **a quién le termina más tarde su tramo actual**.
+- Son sumas, conteos y dos argmax sobre los mismos datos: una **reducción** con un operador compuesto, en **una sola pasada**.
+- **Base en el curso (`ec2/08_reduction`).** `bikeshare_daily_summary.cu` (el cierre del día con varias reducciones en una pasada: bicis devueltas, en reparación y fuera, que es el mismo patrón de estados que los repartidores), `bikeshare_kpis.cu` (un struct con `combine` campo por campo y cada campo por shuffle) y `bikeshare_bike_totals.cu` (argmax de pares `(valor, índice)` con prueba de empates). La viñeta del README «dos reducciones independientes que deben coincidir» da la verificación cruzada.
+- **Datos.** Lo que ya da `Courier::view()` de cada repartidor. No hace falta ningún atributo ni método nuevo en el programa.
+- Referencia en CPU: `cpuOne`, un recorrido con un `Summary`.
+
+### Dónde se usa en el programa
+- El resumen final: un panel con el estado de la flota.
+- Solo **lee** `Courier::view()` (a través de `Simulation::fleet()`). No modifica ninguna clase existente.
+- Con `EQ_GPU=1` se calcula a través del único hilo dueño de la GPU. La llamada va en la función del resumen final que el capítulo 8 ya escribe para las demás aplicaciones: esta aplicación no agrega ninguna modificación propia.
+
+### Diseño
+- **Datos (SoA).** `state[i]`, `available[i]`, `items[i]` y `picked[i]` (1 byte cada uno, viajan en un solo buffer) y `legEndMs[i]` (8 B). 12 B por repartidor.
+- **Operador.** `combine` suma los conteos y, para los argmax, usa `beats`: gana el mayor valor y, a igual valor, el índice menor. Es asociativo y conmutativo y tiene identidad (ceros e índice `0xffffffff`), como en el curso.
+- **Block y grid.** 256 threads (8 warps). Cada thread recorre unos 4 repartidores (coarsening) en un bucle con salto de grilla, así que el grid tiene `ceil(K / 1024)` bloques, con un tope de 1024.
+- **Reducción en dos etapas por warp.** Cada warp reduce con shuffles (cada campo por separado), la lane 0 guarda el resumen del warp, **una barrera**, y el warp 0 reduce los resúmenes de los warps.
+- **Entre bloques, sin atomics.** Cada bloque escribe un resumen parcial. Un **segundo kernel** de 1 bloque los combina en un orden fijo: es la segunda opción de `bikeshare_kpis.cu` y da el mismo resultado en cada corrida.
+- **Dos versiones del kernel (sesión 12, diapositiva 21: versiones «divergente» y «sin ramas» del mismo trabajo).** `fleetBranchFree` (la final: cada estado suma un 0 o un 1 y los argmax son selecciones) y `fleetBranchy` (un `switch` y `if` por repartidor).
+- **CPU N threads.** Cada thread resume su rango en un `Summary` local y después se combinan en orden de thread.
+
+### Correctitud
+- Son enteros: las dos versiones de GPU y la CPU con N threads deben dar **exactamente** lo mismo que `cpuOne`, campo por campo. Sin tolerancia.
+- **Empates a propósito.** Tres repartidores tienen exactamente el mismo `legEnd`, el más grande: debe ganar el de índice menor. Además, muchísimos repartidores comparten la bolsa más llena (3 pedidos): también debe ganar el menor.
+- **Dos reducciones que deben coincidir** (README del curso): los cuatro conteos de estado suman exactamente el tamaño de la flota.
+- Los 5 tamaños dan `correct=yes` en todas las filas del CSV.
+- compute-sanitizer (`results/sanitizer_laptop_fleetsum.txt`): memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors. Racecheck revisa los resúmenes de warp en shared memory y su barrera.
+- **Check-then-act.** El resultado es una foto de un instante. `view()` toma cada repartidor por separado, así que la foto de toda la flota no es atómica. Es solo informativo: no cambia ningún pedido ni toca ningún invariante del brief.
+
+### Resultados
+Laptop: Intel i9-12900H (6P + 8E cores, 20 threads), RTX 3060 Laptop GPU, WSL2, Release (-O3).
+Mediana de 10 repeticiones intercaladas, después de un warm-up. Tiempos en ms. GPU = versión sin ramas.
+Fuente: `results/bench_laptop_fleetsum.csv`, tabla de `analysis/report.ipynb`.
+Entradas: flotas sintéticas con semilla fija. Estados al azar (40 % `Idle`, 30 % `ToRestaurant`, 25 % `Carrying`, 5 % `Broken`) y bolsas de 1 a 3 pedidos. **2000 = la flota de `city_60`.**
+
+| size (repartidores) | CPU 1 | mejor CPU | GPU kernel | GPU end to end | speedup kernel | speedup e2e | correct |
+|---|---|---|---|---|---|---|---|
+| 100 | 0.0005 | 0.0005 (CPU 1) | 0.015 | 0.623 | 0.03 | 0.001 | yes |
+| **2000 (ciudad)** | 0.004 | 0.004 (CPU 1) | 0.015 | 0.641 | 0.28 | **0.007** | yes |
+| 10⁴ | 0.021 | 0.021 (CPU 1) | 0.042 | 0.635 | 0.49 | 0.033 | yes |
+| 10⁵ | 0.198 | 0.177 (N=2) | 0.050 | 0.874 | 3.5 | 0.20 | yes |
+| 10⁶ | 1.966 | 0.532 (N=4) | 0.106 | 3.157 | 5.0 | 0.17 | yes |
+
+- **Tamaño del problema** = repartidores: de 10² a 10⁶, 4 órdenes de magnitud.
+- **Misma máquina.** CPU y GPU son de la misma laptop: esta tabla ya es la comparación «same-machine».
+
+![time vs size](../results/time_vs_size.png)
+
+**Copies vs kernel.** Parte del end to end que es kernel: 2.5 % (100), 2.4 %, 6.6 %, 5.7 %, 3.4 % (10⁶). **Más del 93 % es copiar, reservar memoria y lanzar los dos kernels.** Con 10⁶ repartidores se suben 12 MB (4 B + 8 B por repartidor) y vuelven 72 bytes: un solo `Summary`.
+
+![copies vs kernels](../results/copy_share.png)
+
+**Thread sweep (10⁶, mediana).** 1 thread: 1.97 ms · 2: 0.87 · 4: 0.53 · 8: 0.76 · 14: 0.94 · 20: 1.26 ms.
+El mejor es **4 threads (3.7×)**. Con más threads empeora: la CPU resume un repartidor en unos 2 ns, y crear y juntar 20 threads cuesta más que el trabajo.
+
+![thread sweep](../results/thread_sweep.png)
+
+### Con ramas contra sin ramas (el antes/después de divergencia, sesión 12)
+Mediana del kernel y del end to end, en ms.
+
+| size | kernel sin ramas | kernel con ramas | con ramas / sin ramas | e2e sin ramas | e2e con ramas |
+|---|---|---|---|---|---|
+| 100 | 0.015 | 0.016 | 1.03 | 0.622 | 0.469 |
+| 2000 | 0.015 | 0.017 | 1.13 | 0.641 | 0.521 |
+| 10⁴ | 0.042 | 0.039 | 0.93 | 0.635 | 0.527 |
+| 10⁵ | 0.050 | 0.047 | 0.95 | 0.874 | 0.751 |
+| 10⁶ | 0.106 | 0.104 | 0.98 | 3.157 | 2.961 |
+
+- **El kernel tarda lo mismo con y sin ramas** (la relación va de 0.93 a 1.13, dentro del ruido).
+- **El end to end «con ramas» parece mejor, pero es el orden de las versiones.** La primera versión de GPU que corre paga unos 0.1–0.2 ms extra, y en la tabla `gpu` (sin ramas) va primera. Lo comprobé invirtiendo el orden (`results/probe_laptop_fleetsum_order.csv`, `--threads 4`):
+
+| size | sin ramas, orden oficial | sin ramas, invertido | con ramas, orden oficial | con ramas, invertido |
+|---|---|---|---|---|
+| 2000 | 0.641 | 0.559 | 0.521 | 0.513 |
+| 10⁵ | 0.874 | 0.756 | 0.751 | 0.940 |
+| 10⁶ | 3.157 | 3.090 | 2.961 | 3.209 |
+
+  Con el orden invertido el que va primero es el que paga: con 10⁵ y 10⁶, «con ramas» pasa a ser el más lento. **No hay diferencia real en el end to end.**
+
+### Profiler (Nsight Compute, 10⁶ repartidores, grid 977, block 256)
+| Métrica | `fleetBranchFree` | `fleetBranchy` |
+|---|---|---|
+| Duration | 60.8 µs | 59.0 µs |
+| Theoretical / achieved occupancy | 83.3 % / 76.6 % | 83.3 % / 75.0 % |
+| Block limit: warps / registers / shared mem | 6 / 5 / 9 bloques | 6 / 5 / 9 bloques |
+| Registers per thread · shared por bloque | 48 · 576 B | 48 · 576 B |
+| Waves per SM | 6.51 | 6.51 |
+| Compute (SM) throughput | 74.6 % | 75.7 % |
+| DRAM throughput | 64.0 % (215 GB/s) | 66.4 % (223 GB/s) |
+| L1/TEX · L2 throughput | 77.7 % · 19.4 % | 78.5 % · 20.0 % |
+| L1/TEX · L2 hit rate | 1.6 % · 1.8 % | 1.5 % · 1.9 % |
+| Avg. active threads per warp | 31.1 de 32 | 29.3 de 32 |
+| Branch efficiency · divergent branches | 84.5 % · 73 | 60.8 % · 594 |
+
+- **Occupancy (método de la sesión 12).** 256 threads son 8 warps. El SM admite 6 bloques por warps y 9 por shared memory, pero solo **5 por registros**: 48 registros × 256 threads = 12 288 de los 65 536 del SM. **El límite son los registros:** 5 × 8 = 40 de 48 warps = 83.3 %. La alcanzada es 75–77 %.
+- **Divergencia: 8 veces menos ramas divergentes sin ramas** (594 → 73), la branch efficiency sube de 60.8 % a 84.5 % y los threads activos de 29.3 a 31.1. No llega a 100 %: probablemente queda la comparación de los argmax y la última vuelta del bucle. No se midió por separado.
+- **Pero el tiempo no cambia** (59.0 µs contra 60.8 µs). El kernel no está limitado por los threads que se apagan, sino por la cantidad de instrucciones: el cómputo está al 75 %.
+- **Ni memory-bound ni compute-bound puro:** SM al 75 %, DRAM al 64–66 % y L1/TEX al 78 %. Cada repartidor son solo 12 B, pero `combine` mueve unos 11 campos por shuffle en cada uno de los 5 pasos de cada warp. Que L1/TEX esté tan alto probablemente viene de esos shuffles. No se midió.
+
+### Roofline
+- Conteo por repartidor: 4 comparaciones y 4 sumas de estado, 3 sumas (`available`, `items`, `picked`) y 2 argmax de unas 4 operaciones cada uno: **unas 20 operaciones enteras**. Bytes: 12 leídos (**12 B**).
+- Intensidad aritmética: **1.67 op/byte**. Ridge point ≈ 48: a la izquierda del ridge.
+- Rendimiento alcanzado con 10⁶, tiempo por eventos (0.106 ms): **1.9 × 10¹¹ op/s**. El techo de memoria en 1.67 op/byte es 1.67 × 336 GB/s = 5.6 × 10¹¹ op/s: llega al **34 %**.
+- Con el tiempo de Nsight Compute (60.8 µs): 3.3 × 10¹¹ op/s, el **59 %**.
+- **Ojo:** las 20 operaciones son un conteo abstracto. Las instrucciones reales son más (los shuffles del struct), y por eso el SM está al 75 % aunque el roofline lo ubique lejos del techo.
+
+![roofline](../results/roofline.png)
+
+### Análisis
+- **Paralelismo.** Cada thread resume unos 4 repartidores. El grid tiene 1 bloque con 100, 2 con 2000, 10 con 10⁴, 98 con 10⁵ y 977 con 10⁶. Caben 5 bloques por SM, 150 a la vez: con 10⁶ son 6.5 waves. Hasta 10⁴ la GPU está casi vacía.
+- **Overheads.** El kernel es entre el 2 y el 7 % del end to end. Hay que subir 12 B por repartidor y lanzar dos kernels.
+- **¿Los datos pueden quedarse en la GPU?** En el programa, no: la flota se lee de cada `Courier` con `view()` (un mutex y una copia por repartidor) en cada consulta. No se midió cuánto cuesta esa lectura.
+- **Memory-bound o compute-bound.** Ni uno ni otro puro (ver el profiler).
+- **Optimización antes/después.** Con ramas contra sin ramas es el antes/después de divergencia: 8 veces menos ramas divergentes y el mismo tiempo.
+- **Contención y sincronización.** Sin atomics. Una barrera por bloque (la reducción en dos etapas) y el segundo kernel hace de barrera global, con los parciales combinados en orden fijo: determinista.
+- **Correctitud en paralelo.** Todo es entero: la suma es exacta en cualquier orden (el curso lo muestra con enteros contra `float` en `bikeshare_kpis.cu`) y los empates los resuelve el índice, no el orden de los threads.
+
+### Veredicto
+- **Crossover end to end: nunca.** La GPU no le gana a la mejor CPU en ningún tamaño (máximo 0.20×).
+- **El kernel gana desde 10⁵: 3.5–5.0×.** Pero el kernel es menos del 7 % del tiempo total.
+- **Escala del brief (8 repartidores):** menos de 1 µs. **CPU.**
+- **Ciudad (`city_60`, 2000 repartidores):** la CPU con 1 thread tarda 0.004 ms y la GPU 0.64 ms end to end (0.007×). **CPU.**
+- **Decisión: mantener la CPU.** Lo que sí deja esta aplicación: un operador compuesto con argmax y desempate por índice, la verificación cruzada y la comparación divergente contra sin ramas.
+
+### Threats to validity
+- **Kernels muy cortos.** Con 100 a 2000 repartidores el kernel dura unos 15 µs, casi el costo de lanzarlo.
+- **Orden de las versiones.** La primera versión de GPU paga 0.1–0.2 ms extra en el end to end (ver arriba). La tabla pone `gpu` primera. Para comparar con y sin ramas es más confiable Nsight Compute que el end to end.
+- **Eventos contra ncu.** Con 10⁶ el kernel mide 106 µs por eventos y 60.8 µs en ncu: el tiempo por eventos incluye el launch de los dos kernels.
+- **Dispersión de la CPU multithread.** Con 10⁶ y 20 threads: de 1.18 a 1.59 ms. Por eso se reporta la mediana.
+- **Entrada sintética.** Estados al azar y bolsas de 1 a 3. En el programa hay como mucho unos 2000 repartidores.
+- La CPU y la GPU de la laptop comparten potencia y temperatura. En WSL2 cada launch y cada copia pasa por la capa WDDM de Windows.
+
+### Cómo reproducir
+```bash
+./build-gpu/delivery_sim config/equipetrol.json --bench results/bench_laptop_fleetsum.csv --machine laptop --threads 1,2,4,8,14,20 --apps fleetsum
+for tool in memcheck racecheck synccheck; do
+  compute-sanitizer --tool $tool ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/s.csv --size 0 --reps 1 --threads 2 --apps fleetsum
+done
+ncu --set full -k regex:"fleetBranchFree|fleetBranchy" -c 4 --csv --page details ./build-gpu/delivery_sim config/equipetrol.json --bench /tmp/n.csv --size 4 --reps 1 --threads 2 --apps fleetsum
+cd analysis && jupyter nbconvert --to notebook --execute --allow-errors --inplace report.ipynb
+```
+La prueba del orden (`probe_laptop_fleetsum_order.csv`) se hizo invirtiendo temporalmente el orden de los dos `addGpu` en `BenchFleetSummary.cpp` y corriendo `--size 1`, `--size 3` y `--size 4` con `--threads 4`.
